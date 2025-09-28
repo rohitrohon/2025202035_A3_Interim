@@ -1,0 +1,463 @@
+#include "client.h"
+#include "network_utils.h"
+#include "file_utils.h"
+#include <iostream>
+#include <string>
+#include <cstring>
+#include <cstdlib>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sstream>
+#include <thread>
+#include <vector>
+#include <sys/stat.h>
+#include <sys/poll.h>
+#include <errno.h>
+#include <cstring>
+#include <string>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <openssl/sha.h>
+#include <filesystem>
+
+using namespace std;
+using namespace std::filesystem;
+
+// Validate and sanitize file path to prevent directory traversal
+bool is_valid_path(const std::string& path) {
+    // Only allow files in the current directory or subdirectories
+    if (path.empty() || path[0] == '/' || path.find("../") != std::string::npos) {
+        return false;
+    }
+    return true;
+}
+
+// Send error response to peer
+void send_error_response(int sock, const std::string& message) {
+    std::string response = "ERROR: " + message + "\n";
+    send(sock, response.c_str(), response.length(), 0);
+}
+
+// Handle a single peer connection with improved security and error handling
+void handle_peer_connection(int peer_sock) {
+    // Set receive timeout (5 seconds)
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(peer_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+    char buffer[512 * 1024] = {0};
+    ssize_t valread = read(peer_sock, buffer, sizeof(buffer) - 1);
+    
+    if (valread <= 0) {
+        close(peer_sock);
+        return;
+    }
+    
+    buffer[valread] = '\0';
+    string request = string(buffer);
+    
+    // Parse request: format "filepath$chunkno$nchunks"
+    size_t one = request.find('$');
+    size_t two = request.find('$', one + 1);
+    
+    if (one == string::npos || two == string::npos) {
+        send_error_response(peer_sock, "Invalid request format. Use: filepath$chunkno$nchunks");
+        close(peer_sock);
+        return;
+    }
+    
+    string filepath = request.substr(0, one);
+    
+    // Validate file path
+    if (!is_valid_path(filepath)) {
+        send_error_response(peer_sock, "Invalid file path");
+        close(peer_sock);
+        return;
+    }
+    
+    // Parse chunk numbers with error handling
+    int chunkno, nchunks;
+    try {
+        chunkno = stoi(request.substr(one + 1, two - one - 1));
+        nchunks = stoi(request.substr(two + 1));
+        
+        // Validate chunk numbers
+        if (chunkno < 0 || nchunks <= 0 || nchunks > 1000) {  // Arbitrary max chunks limit
+            throw std::out_of_range("Invalid chunk range");
+        }
+    } catch (const std::exception& e) {
+        send_error_response(peer_sock, "Invalid chunk numbers");
+        close(peer_sock);
+        return;
+    }
+    
+    // Open file with error handling
+    int file = open(filepath.c_str(), O_RDONLY);
+    if (file < 0) {
+        send_error_response(peer_sock, "File not found or permission denied");
+        close(peer_sock);
+        return;
+    }
+    
+    // Get file size to validate chunk request
+    struct stat file_stat;
+    if (fstat(file, &file_stat) < 0) {
+        send_error_response(peer_sock, "Could not get file information");
+        close(file);
+        close(peer_sock);
+        return;
+    }
+    
+    off_t file_size = file_stat.st_size;
+    off_t chunk_size = 512 * 1024;  // 512KB chunks
+    off_t start_pos = chunk_size * chunkno;
+    off_t requested_end = start_pos + (chunk_size * nchunks);
+    off_t end_pos = (requested_end < file_size) ? requested_end : file_size;
+    
+    // Validate chunk range
+    if (start_pos >= file_size) {
+        send_error_response(peer_sock, "Chunk number out of range");
+        close(file);
+        close(peer_sock);
+        return;
+    }
+    
+    // Seek to the start position
+    if (lseek(file, start_pos, SEEK_SET) < 0) {
+        send_error_response(peer_sock, "Error seeking to chunk position");
+        close(file);
+        close(peer_sock);
+        return;
+    }
+    
+    // Send file data in chunks
+    ssize_t bytesRead, totalBytesSent = 0;
+    ssize_t remaining = end_pos - start_pos;
+    
+    // Send file data in chunks
+    while (remaining > 0) {
+        // Determine the size of the next chunk to send (up to buffer size)
+        ssize_t chunk_size_to_send = std::min(remaining, static_cast<ssize_t>(sizeof(buffer)));
+        
+        // Read the chunk from the file
+        bytesRead = read(file, buffer, chunk_size_to_send);
+        if (bytesRead <= 0) {
+            if (errno == EINTR) continue;  // Interrupted, try again
+            cerr << "Error reading file: " << strerror(errno) << "\n";
+            break;
+        }
+        
+        // Send the chunk
+        ssize_t bytesSent = 0;
+        while (bytesSent < bytesRead) {
+            ssize_t sent = send(peer_sock, buffer + bytesSent, bytesRead - bytesSent, 
+                              MSG_NOSIGNAL);  // Don't generate SIGPIPE
+            
+            if (sent < 0) {
+                if (errno == EINTR) continue;  // Interrupted, try again
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Socket buffer full, wait a bit
+                    struct pollfd pfd = {peer_sock, POLLOUT, 0};
+                    poll(&pfd, 1, 1000);  // Wait up to 1 second
+                    continue;
+                }
+                cerr << "Error sending data: " << strerror(errno) << "\n";
+                break;
+            }
+            bytesSent += sent;
+        }
+        
+        if (bytesSent < bytesRead) {
+            cerr << "Failed to send complete chunk\n";
+            break;
+        }
+        
+        totalBytesSent += bytesSent;
+        remaining -= bytesSent;
+        
+        // Log progress for large files
+        if (file_size > 10 * 1024 * 1024) {  // For files > 10MB
+            static int last_percent = -1;
+            int percent = (totalBytesSent * 100) / (end_pos - start_pos);
+            if (percent != last_percent && percent % 10 == 0) {
+                cout << "Upload progress: " << percent << "%\r" << flush;
+                last_percent = percent;
+            }
+        }
+    }
+    
+    if (totalBytesSent > 0) {
+        cout << "\nSent " << totalBytesSent << " bytes of file " << filepath 
+             << " (chunk " << chunkno << ")" << endl;
+    } else {
+        cerr << "No data sent for file: " << filepath << endl;
+    }
+    
+    string filename = get_file_name_from_path(filepath);
+    
+    close(peer_sock);
+    close(file);
+}
+
+// Start listening for incoming peer connections
+void start_listening(int listen_port) {
+    int server_fd, new_socket;
+    struct sockaddr_in address;
+    int opt = 1;
+    socklen_t addrlen = sizeof(address);
+    
+    // Create socket file descriptor
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        cerr << "Socket creation failed: " << strerror(errno) << endl;
+        return;
+    }
+    
+    // Set socket options
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        cerr << "Setsockopt failed: " << strerror(errno) << endl;
+        close(server_fd);
+        return;
+    }
+    
+    // Set non-blocking mode
+    int flags = fcntl(server_fd, F_GETFL, 0);
+    if (flags == -1) {
+        cerr << "F_GETFL failed: " << strerror(errno) << endl;
+        close(server_fd);
+        return;
+    }
+    
+    if (fcntl(server_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        cerr << "F_SETFL O_NONBLOCK failed: " << strerror(errno) << endl;
+        close(server_fd);
+        return;
+    }
+    
+    // Bind socket to the port
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(static_cast<uint16_t>(listen_port));
+    
+    if (::bind(server_fd, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) < 0) {
+        cerr << "Bind failed: " << strerror(errno) << endl;
+        close(server_fd);
+        return;
+    }
+    
+    // Start listening
+    if (listen(server_fd, SOMAXCONN) < 0) {
+        cerr << "Listen failed: " << strerror(errno) << endl;
+        close(server_fd);
+        return;
+    }
+    
+    cout << "Listening for incoming connections on port " << listen_port << "..." << endl;
+    
+    struct pollfd fds[1];
+    fds[0].fd = server_fd;
+    fds[0].events = POLLIN;
+    
+    while (true) {
+        // Wait for activity on the server socket with a timeout
+        int activity = poll(fds, 1, 1000); // 1 second timeout
+        
+        if (activity < 0) {
+            if (errno == EINTR) continue; // Interrupted by signal
+            cerr << "Poll error: " << strerror(errno) << endl;
+            break;
+        } else if (activity == 0) {
+            // Timeout occurred, check for shutdown condition if needed
+            continue;
+        }
+        
+        // Check if there's an incoming connection
+        if (fds[0].revents & POLLIN) {
+            // Accept the connection
+            new_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen);
+            if (new_socket < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue; // No pending connections
+                }
+                cerr << "Accept failed: " << strerror(errno) << endl;
+                continue;
+            }
+            
+            // Set socket options for the new connection
+            int opt = 1;
+            setsockopt(new_socket, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
+            
+            // Get client IP for logging
+            char client_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &address.sin_addr, client_ip, INET_ADDRSTRLEN);
+            
+            cout << "New connection from " << client_ip << ":" << ntohs(address.sin_port) << endl;
+            
+            // Create a new thread to handle the connection
+            try {
+                thread(handle_peer_connection, new_socket).detach();
+            } catch (const std::exception& e) {
+                cerr << "Failed to create thread: " << e.what() << endl;
+                close(new_socket);
+            }
+        }
+    }
+    
+    // Cleanup
+    close(server_fd);
+}
+
+// Helper function to extract filename from path
+std::string get_file_name_from_path(const std::string& path) {
+    size_t last_slash = path.find_last_of("/\\");
+    if (last_slash != std::string::npos) {
+        return path.substr(last_slash + 1);
+    }
+    return path;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 3) {
+        cout << "Invalid parameter Format: ./client <IP>:<PORT> tracker_info.txt" << endl;
+        return 0;
+    }
+    
+    string ip_and_port = argv[1];
+    string tracker_filename = argv[2];
+    
+    int i = ip_and_port.find(':');
+    if (i == string::npos || i == 0) {
+        cout << "Invalid format for <IP>:<PORT>" << endl;
+        return 0;
+    }
+
+    string ip_address = ip_and_port.substr(0, i);
+    int listen_port = stoi(ip_and_port.substr(i + 1));
+    
+    // Start listening for peer connections
+    thread listening_thread(start_listening, listen_port);
+    listening_thread.detach();
+    
+    // Read tracker info from file
+    int fd = open(tracker_filename.c_str(), O_RDONLY);
+    if (fd < 0) {
+        cerr << "Failed to open " << tracker_filename << endl;
+        return 1;
+    }
+
+    const int BUFFER_SIZE = 1024;
+    char buffer[BUFFER_SIZE];
+    ssize_t bytesRead = read(fd, buffer, BUFFER_SIZE - 1);
+    if (bytesRead < 0) {
+        cerr << "Failed to read from file." << endl;
+        close(fd);
+        return 1;
+    }
+
+    buffer[bytesRead] = '\0'; 
+    close(fd);
+    
+    stringstream ss(buffer);
+    string line;
+    int sock = -1;
+    string connected_tracker;
+    
+    // Try each tracker in sequence until one connects successfully
+    while (getline(ss, line)) {
+        // Skip empty lines
+        if (line.empty()) continue;
+        
+        // Parse tracker IP and port
+        size_t colon_pos = line.find(':');
+        if (colon_pos == string::npos || colon_pos == 0) {
+            cout << "Invalid format in tracker info file: " << line << endl;
+            continue;
+        }
+
+        string track_ip = line.substr(0, colon_pos);
+        int track_port;
+        try {
+            track_port = stoi(line.substr(colon_pos + 1));
+        } catch (const std::exception& e) {
+            cout << "Invalid port number in tracker info: " << line << endl;
+            continue;
+        }
+        
+        cout << "Trying to connect to tracker " << track_ip << ":" << track_port << "..." << endl;
+        
+        // Try to connect to this tracker
+        // Send the client's listening port as part of the connection info
+        // Format: "PORT <port>"
+        string client_info = "PORT " + to_string(listen_port);
+        sock = connect_to_tracker(track_ip, track_port, client_info);
+        if (sock >= 0) {
+            connected_tracker = track_ip + ":" + to_string(track_port);
+            cout << "Connected to tracker " << connected_tracker << " (listening on port " << listen_port << ")" << endl;
+            // Send a newline to ensure the message is flushed
+            send(sock, "\n", 1, 0);
+            break;
+        }
+        
+        cout << "Failed to connect to tracker " << track_ip << ":" << track_port << endl;
+    }
+    
+    if (sock < 0) {
+        cout << "Failed to connect to any tracker. Please check if any tracker is running." << endl;
+        return 0;
+    }
+    
+    // Function to trim whitespace from a string
+    auto trim = [](string& s) {
+        s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](int ch) {
+            return !std::isspace(ch);
+        }));
+        s.erase(std::find_if(s.rbegin(), s.rend(), [](int ch) {
+            return !std::isspace(ch);
+        }).base(), s.end());
+        return s;
+    };
+
+    // Main command loop
+    while (true) {
+        string command;
+        cout << "> ";
+        getline(cin, command);
+        
+        // Trim the command
+        command = trim(command);
+        
+        if (command.empty()) {
+            continue;
+        }
+        
+        // Convert to lowercase for command matching
+        string lower_command = command;
+        std::transform(lower_command.begin(), lower_command.end(), lower_command.begin(), 
+                      [](unsigned char c){ return std::tolower(c); });
+        
+        // Special case for quit command
+        if (lower_command == "quit" || lower_command == "exit") {
+            break;
+        }
+        
+        // Send the original command (preserving case for passwords)
+        send(sock, command.c_str(), command.length(), 0);
+        
+        char response[1024] = {0};
+        ssize_t valread = read(sock, response, sizeof(response));
+        
+        if (valread > 0) {
+            cout << response << endl;
+        } else {
+            cout << "Tracker disconnected!" << endl;
+            break;
+        }
+    }
+    
+    close(sock);
+    return 0;
+}
