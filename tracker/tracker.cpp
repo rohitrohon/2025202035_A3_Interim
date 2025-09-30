@@ -28,7 +28,6 @@ atomic<bool> thread_run{true};
 // Signal handler for clean shutdown
 void signal_handler(int signal) {
     if (signal == SIGINT || signal == SIGTERM) {
-        cout << "\nShutting down tracker..." << endl;
         thread_run = false;
     }
 }
@@ -40,7 +39,10 @@ void tracker_loop(int tracker_sock) {
     while (thread_run) {
         int client_sock = accept(tracker_sock, (struct sockaddr*)&client_addr, &client_len);
         if (client_sock < 0) {
-            cout << "Failed to accept client connection." << endl;
+            // Don't print error during normal shutdown
+            if (thread_run) {
+                perror("Client connection error");
+            }
             continue;
         }
 
@@ -78,38 +80,54 @@ bool initialize_tracker(const string& tracker_file, int tracker_no, string& ip_a
     getline(ss, firstLine);
     getline(ss, secondLine);
 
-    if (tracker_no == 1) {
-        size_t i = firstLine.find(':');
-        if (i != string::npos) {
-            ip_address = firstLine.substr(0, i);
-            port = stoi(firstLine.substr(i + 1));
-        }
-
-        const char* filepath = "../client/tracker_info.txt";
-        fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-        if (fd < 0) {
-            cerr << "Failed to open file for writing: " << filepath << endl;
-            return false;
-        }
-        write(fd, firstLine.c_str(), firstLine.size());
-        close(fd);
-
-    } else if (tracker_no == 2) {
-        size_t i = secondLine.find(':');
-        if (i != string::npos) {
-            ip_address = secondLine.substr(0, i);
-            port = stoi(secondLine.substr(i + 1));
-        }
-
-        const char* filepath = "../client/tracker_info.txt";
-        fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-        if (fd < 0) {
-            cerr << "Failed to open file for writing: " << filepath << endl;
-            return false;
-        }
-        write(fd, secondLine.c_str(), secondLine.size());
-        close(fd);
+    const char* filepath = "../client/tracker_info.txt";
+    string currentLine = (tracker_no == 1) ? firstLine : secondLine;
+    string otherLine = (tracker_no == 1) ? secondLine : firstLine;
+    
+    // Extract IP and port from the current line
+    size_t i = currentLine.find(':');
+    if (i != string::npos) {
+        ip_address = currentLine.substr(0, i);
+        port = stoi(currentLine.substr(i + 1));
     }
+
+    // Read existing content if file exists
+    vector<string> existingLines;
+    ifstream infile(filepath);
+    if (infile) {
+        string line;
+        while (getline(infile, line)) {
+            if (!line.empty()) {
+                // Skip if this is the same as the other tracker's line to avoid duplicates
+                if (line != otherLine) {
+                    existingLines.push_back(line);
+                }
+            }
+        }
+        infile.close();
+    }
+    
+    // Open file for writing (this will truncate the file)
+    ofstream outfile(filepath, ios::out | ios::trunc);
+    if (!outfile) {
+        cerr << "Failed to open file for writing: " << filepath << endl;
+        return false;
+    }
+    
+    // Write the current tracker's info first
+    outfile << currentLine << "\n";
+    
+    // Then write any existing lines that aren't from the other tracker
+    for (const auto& line : existingLines) {
+        outfile << line << "\n";
+    }
+    
+    // If this is the first tracker starting, also write the other tracker's info
+    if (existingLines.empty() && !otherLine.empty()) {
+        outfile << otherLine << "\n";
+    }
+    
+    outfile.close();
 
     return !ip_address.empty();
 }
@@ -150,7 +168,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    cout << "Using IP Address: " << ip_address << " and Port: " << port << endl;
+    // Removed debug output
 
     int tracker_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (tracker_sock == -1) {
@@ -158,19 +176,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    int no = 1;
-    // Set SO_REUSEADDR
-    if (setsockopt(tracker_sock, SOL_SOCKET, SO_REUSEADDR, &no, sizeof(no)) < 0) {
-        perror("setsockopt SO_REUSEADDR");
+    // Set SO_REUSEADDR to allow quick reuse of the port after restart
+    int yes = 1;
+    if (setsockopt(tracker_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
+        perror("Warning: setsockopt(SO_REUSEADDR) failed");
         // Not fatal, continue
     }
-    // Set SO_REUSEPORT (may not be available or behave differently across OS)
-#ifdef SO_REUSEPORT
-    if (setsockopt(tracker_sock, SOL_SOCKET, SO_REUSEPORT, &no, sizeof(no)) < 0) {
-        perror("setsockopt SO_REUSEPORT");
-        // Not fatal, continue
-    }
-#endif
     sockaddr_in tracker_addr;
     tracker_addr.sin_family = AF_INET;
     tracker_addr.sin_port = htons(port);
@@ -232,7 +243,7 @@ int main(int argc, char *argv[]) {
     }
     
     cout << "Tracker " << tracker_no << " started with sync port: " << sync_config.sync_port << endl;
-    cout << "Other tracker: " << sync_config.other_tracker_ip << ":" << sync_config.other_tracker_port << endl;
+    // Removed other tracker output
 
     // Start tracker loop in a separate thread
     thread tracker_thread(tracker_loop, tracker_sock);
@@ -252,16 +263,16 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // Cleanup
-    cout << "Shutting down tracker..." << endl;
-    
     // Close the server socket to unblock accept()
     if (tracker_sock >= 0) {
         shutdown(tracker_sock, SHUT_RDWR);
         close(tracker_sock);
     }
     
-    // Wait for tracker thread to finish
+    // Signal the tracker thread to stop
+    thread_run = false;
+    
+    // Wait for the tracker thread to finish
     if (tracker_thread.joinable()) {
         tracker_thread.join();
     }

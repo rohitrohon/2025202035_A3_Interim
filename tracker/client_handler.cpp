@@ -96,15 +96,41 @@ void* client_thread_func(void* arg) {
 
 void process_client_request(const std::string& command, int client_sock, 
                            std::string& client_user_id, const std::string& client_ip, int client_port) {
-    std::istringstream ss(command);
+    // Debug: Print raw command received
+    std::cout << "DEBUG: Raw command received: '" << command << "' (length: " << command.length() << ")" << std::endl;
+    std::cout << "DEBUG: Hex dump: ";
+    for (char c : command) {
+        std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)c << " ";
+    }
+    std::cout << std::dec << std::endl;
+
+    // Debug: Print the raw command with length
+    std::cout << "DEBUG: Raw command before trim: '" << command << "' (length: " << command.length() << ")" << std::endl;
+    
+    // Trim any leading/trailing whitespace including newlines
+    auto cmd_trimmed = command;
+    cmd_trimmed.erase(cmd_trimmed.find_last_not_of(" \t\n\r\f\v") + 1);
+    cmd_trimmed.erase(0, cmd_trimmed.find_first_not_of(" \t\n\r\f\v"));
+    
+    std::cout << "DEBUG: Command after trim: '" << cmd_trimmed << "' (length: " << cmd_trimmed.length() << ")" << std::endl;
+    
+    std::istringstream ss(cmd_trimmed);
     std::vector<std::string> tokens;
     std::string token;
     
     while (std::getline(ss, token, ' ')) {
+        // Trim each token to remove any remaining whitespace
+        token.erase(token.find_last_not_of(" \t\n\r\f\v") + 1);
+        token.erase(0, token.find_first_not_of(" \t\n\r\f\v"));
+        
         if (!token.empty()) {
             tokens.push_back(token);
+            std::cout << "DEBUG: Token: ['" << token << "'] (length: " << token.length() << ")" << std::endl;
         }
     }
+    
+    // Debug: Print all tokens
+    std::cout << "DEBUG: Found " << tokens.size() << " tokens" << std::endl;
     
     if (tokens.empty()) {
         const char* response = "Invalid command";
@@ -115,8 +141,14 @@ void process_client_request(const std::string& command, int client_sock,
     // Handle commands with spaces in them (e.g., "login user" -> "login_user")
     std::string cmd = tokens[0];
     
-    // Handle multi-word commands by checking the second token
-    if (tokens.size() > 1) {
+    // First check if the command is already in the combined format (e.g., "list_groups")
+    if (cmd == "list_groups" || cmd == "create_user" || cmd == "create_group" || 
+        cmd == "join_group" || cmd == "list_requests" || cmd == "accept_request" || 
+        cmd == "leave_group") {
+        // Command is already in the correct format, use as is
+    }
+    // Handle multi-word commands by checking the second token (e.g., "list groups" -> "list_groups")
+    else if (tokens.size() > 1) {
         std::string potential_cmd = tokens[0] + "_" + tokens[1];
         // Check if this is a known command with underscore
         if (potential_cmd == "create_user" || 

@@ -111,30 +111,38 @@ void force_sync() {
     sync_requested = true;
     sync_cv.notify_one();
 }
-
 // Shutdown the sync system
 void shutdown_sync_system() {
     // Signal threads to stop
     sync_thread_run = false;
     
-    // Notify sync thread in case it's waiting
-    sync_cv.notify_all();
-    
-    // Close server socket to unblock accept()
+    // Close the server socket to unblock accept()
     if (server_socket >= 0) {
-        shutdown(server_socket, SHUT_RDWR);
-        close(server_socket);
-        server_socket = -1;
+        int sock = server_socket;
+        server_socket = -1;  // Mark as closed first
+        shutdown(sock, SHUT_RDWR);
+        close(sock);
     }
     
-    // Wait for threads to finish
-    if (sync_thread.joinable()) {
-        sync_thread.join();
-    }
+    // Wait for threads to finish with a timeout
+    auto wait_for_thread = [](thread& t) {
+        if (t.joinable()) {
+            if (t.get_id() != this_thread::get_id()) {
+                // Simple join with timeout
+                for (int i = 0; i < 5 && t.joinable(); ++i) {
+                    this_thread::sleep_for(chrono::milliseconds(100));
+                }
+                if (t.joinable()) {
+                    t.detach();
+                }
+            } else {
+                t.detach();
+            }
+        }
+    };
     
-    if (server_thread.joinable()) {
-        server_thread.join();
-    }
+    wait_for_thread(sync_thread);
+    wait_for_thread(server_thread);
 }
 
 // Start the sync server to handle incoming sync requests
@@ -174,7 +182,7 @@ void sync_server_thread() {
         return;
     }
     
-    cout << "Sync server listening on port " << sync_config.sync_port << endl;
+    // Sync server started on port
     
     // Main server loop
     while (sync_thread_run) {
@@ -184,7 +192,15 @@ void sync_server_thread() {
         // Use select to make accept() non-blocking
         fd_set read_fds;
         FD_ZERO(&read_fds);
-        FD_SET(server_socket, &read_fds);
+        
+        // Only add server_socket to the set if it's still valid
+        if (server_socket >= 0) {
+            FD_SET(server_socket, &read_fds);
+        } else {
+            // If server_socket is invalid, sleep briefly and continue
+            this_thread::sleep_for(chrono::milliseconds(100));
+            continue;
+        }
         
         struct timeval tv;
         tv.tv_sec = 1;
@@ -193,7 +209,14 @@ void sync_server_thread() {
         int ready = select(server_socket + 1, &read_fds, nullptr, nullptr, &tv);
         if (ready < 0) {
             if (errno == EINTR) continue;  // Interrupted by signal
-            perror("select() failed");
+            if (errno == EBADF) {
+                // Socket was closed, exit the loop
+                break;
+            }
+            // Only log unexpected errors
+            if (errno != EBADF) {
+                perror("select() failed");
+            }
             break;
         }
         
@@ -618,7 +641,7 @@ bool is_other_tracker_alive(const string& ip, int port) {
 
 // Main synchronization function (runs in a separate thread)
 void synchronize_with_other_tracker() {
-    cout << "Synchronization thread started" << endl;
+    // Synchronization thread started
     
     while (true) {
         // Check if we should exit
@@ -699,5 +722,5 @@ void synchronize_with_other_tracker() {
         close(sock);
     }
     
-    cout << "Synchronization thread stopped" << endl;
+    // Synchronization thread stopped
 }

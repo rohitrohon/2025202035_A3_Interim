@@ -25,7 +25,15 @@ vector<PeerInfo> parse_peer_data(const string& message) {
             string ip = client_info.substr(one + 1, two - one - 1);
             string filepath = client_info.substr(two + 1);
             
-            PeerInfo peer = {port, ip, filepath};
+            PeerInfo peer;
+            peer.peer_id = "";  // Will be set by the caller if needed
+            peer.ip = ip;
+            peer.port = static_cast<uint16_t>(stoi(port));
+            peer.downloaded = 0;
+            peer.uploaded = 0;
+            peer.left = 0;
+            peer.event = "";
+            
             peers.push_back(peer);
         }
     }

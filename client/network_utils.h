@@ -3,13 +3,8 @@
 
 #include <string>
 #include <vector>
+#include "client.h"
 using namespace std;
-
-struct PeerInfo {
-    string port;
-    string ip;
-    string file_path;
-};
 
 // Network utility functions
 vector<PeerInfo> parse_peer_data(const string& message);

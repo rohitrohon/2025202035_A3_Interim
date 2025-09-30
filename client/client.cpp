@@ -5,6 +5,7 @@
 #include <string>
 #include <cstring>
 #include <cstdlib>
+#include <iomanip>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -13,16 +14,16 @@
 #include <thread>
 #include <vector>
 #include <sys/stat.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <sys/types.h>
 #include <sys/poll.h>
 #include <errno.h>
-#include <cstring>
-#include <string>
-#include <iostream>
+#include <netdb.h>
 #include <fstream>
-#include <sstream>
-#include <iomanip>
-#include <openssl/sha.h>
+#include <algorithm>
 #include <filesystem>
+#include <openssl/sha.h>
 
 using namespace std;
 using namespace std::filesystem;
@@ -421,10 +422,29 @@ int main(int argc, char *argv[]) {
         return s;
     };
 
+    // Read and discard any initial data (like welcome message or newline)
+    char initial_buffer[1024];
+    fd_set readfds;
+    struct timeval tv;
+    
+    // Set up the timeout
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000; // 100ms timeout
+    
+    // Check if there's any data to read
+    FD_ZERO(&readfds);
+    FD_SET(sock, &readfds);
+    
+    if (select(sock + 1, &readfds, NULL, NULL, &tv) > 0) {
+        // Data is available, read and discard it
+        recv(sock, initial_buffer, sizeof(initial_buffer) - 1, 0);
+    }
+    
     // Main command loop
     while (true) {
         string command;
         cout << "> ";
+        cout.flush();  // Ensure the prompt is displayed
         getline(cin, command);
         
         // Trim the command
@@ -444,14 +464,41 @@ int main(int argc, char *argv[]) {
             break;
         }
         
-        // Send the original command (preserving case for passwords)
-        send(sock, command.c_str(), command.length(), 0);
+        // Send the command with a newline terminator
+        string command_to_send = command + "\n";
         
+        // Debug: Print what we're about to send
+        cout << "DEBUG: Sending command: '" << command_to_send << "' (length: " << command_to_send.length() << ")" << endl;
+        cout << "DEBUG: Hex dump: ";
+        for (char c : command_to_send) {
+            cout << hex << setw(2) << setfill('0') << (int)(unsigned char)c << " ";
+        }
+        cout << dec << endl;
+        
+        ssize_t total_sent = 0;
+        ssize_t bytes_sent;
+        
+        // Keep sending until all bytes are sent
+        while (total_sent < command_to_send.length()) {
+            bytes_sent = send(sock, command_to_send.c_str() + total_sent, 
+                             command_to_send.length() - total_sent, 0);
+            if (bytes_sent <= 0) {
+                cout << "Failed to send command to tracker" << endl;
+                continue;
+            }
+            total_sent += bytes_sent;
+        }
+        
+        // Read and display the response
         char response[1024] = {0};
-        ssize_t valread = read(sock, response, sizeof(response));
+        ssize_t valread = recv(sock, response, sizeof(response) - 1, 0);
         
         if (valread > 0) {
-            cout << response << endl;
+            cout << response;
+            // Ensure the response ends with a newline
+            if (response[strlen(response) - 1] != '\n') {
+                cout << endl;
+            }
         } else {
             cout << "Tracker disconnected!" << endl;
             break;
@@ -460,4 +507,64 @@ int main(int argc, char *argv[]) {
     
     close(sock);
     return 0;
+}
+
+// Helper function to communicate with tracker
+bool communicate_with_tracker(const std::string& tracker_url, 
+                            const std::string& request, 
+                            std::string& response) {
+    // Parse tracker URL (format: "host:port")
+    size_t colon_pos = tracker_url.find(':');
+    if (colon_pos == std::string::npos) {
+        return false;
+    }
+    
+    std::string host = tracker_url.substr(0, colon_pos);
+    int port = std::stoi(tracker_url.substr(colon_pos + 1));
+    
+    // Create socket
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        return false;
+    }
+    
+    // Set up server address
+    struct sockaddr_in server_addr;
+    struct hostent *server;
+    
+    server = gethostbyname(host.c_str());
+    if (server == nullptr) {
+        close(sockfd);
+        return false;
+    }
+    
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    memcpy(&server_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+    server_addr.sin_port = htons(port);
+    
+    // Connect to server
+    if (connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        close(sockfd);
+        return false;
+    }
+    
+    // Send request
+    if (send(sockfd, request.c_str(), request.length(), 0) < 0) {
+        close(sockfd);
+        return false;
+    }
+    
+    // Receive response
+    char buffer[4096];
+    ssize_t bytes_received = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
+    close(sockfd);
+    
+    if (bytes_received <= 0) {
+        return false;
+    }
+    
+    buffer[bytes_received] = '\0';
+    response = std::string(buffer);
+    return true;
 }
