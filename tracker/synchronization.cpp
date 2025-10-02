@@ -495,11 +495,9 @@ static void apply_state(const string& state_str) {
             }
             
             pthread_mutex_lock(&group_admin_mutex);
-            // Merge group admins instead of replacing
+            // Overwrite group admins with incoming state so admin transfers propagate
             for (const auto& [group, admin] : admins) {
-                // Only add if the group doesn't exist or if we're the admin
-                if (group_admin.find(group) == group_admin.end() || 
-                    group_admin[group] == admin) {  // Only update if admin is the same
+                if (!group.empty()) {
                     group_admin[group] = admin;
                 }
             }
@@ -538,14 +536,10 @@ static void apply_state(const string& state_str) {
             }
             
             pthread_mutex_lock(&group_members_mutex);
-            // Merge group members instead of replacing
+            // Overwrite local group members with incoming state so removals propagate
             for (const auto& [group, member_set] : members) {
-                // If group doesn't exist, add it with its members
-                if (group_members.find(group) == group_members.end()) {
+                if (!group.empty()) {
                     group_members[group] = member_set;
-                } else {
-                    // Otherwise, merge the member sets
-                    group_members[group].insert(member_set.begin(), member_set.end());
                 }
             }
             pthread_mutex_unlock(&group_members_mutex);
@@ -671,9 +665,33 @@ static void apply_state(const string& state_str) {
                 files_str.erase(0, pos + 1);
             }
             
-            // Update file metadata
+            // Merge file metadata: update/add incoming, keep existing locals not present
             pthread_mutex_lock(&file_metadata_mutex);
-            file_metadata = new_metadata; // Replace entire map to handle deletions
+            for (auto &kv : new_metadata) {
+                const string &fh = kv.first;
+                FileInfo &incoming = kv.second;
+                auto it = file_metadata.find(fh);
+                if (it == file_metadata.end()) {
+                    file_metadata[fh] = incoming;
+                } else {
+                    FileInfo &local = it->second;
+                    // Overwrite basic fields from incoming
+                    local.file_name = incoming.file_name;
+                    local.file_path = incoming.file_path.size() ? incoming.file_path : local.file_path;
+                    local.file_size = incoming.file_size ? incoming.file_size : local.file_size;
+                    local.owner_id = incoming.owner_id.size() ? incoming.owner_id : local.owner_id;
+                    local.total_chunks = incoming.total_chunks ? incoming.total_chunks : local.total_chunks;
+                    // Merge chunk owners
+                    for (auto &co : incoming.chunk_owners) {
+                        auto &dst = local.chunk_owners[co.first];
+                        dst.insert(co.second.begin(), co.second.end());
+                    }
+                    // Prefer incoming chunk hashes if provided
+                    if (!incoming.chunk_hashes.empty()) {
+                        local.chunk_hashes = incoming.chunk_hashes;
+                    }
+                }
+            }
             pthread_mutex_unlock(&file_metadata_mutex);
         }
         else if (type == "GROUP_FILES") {
@@ -709,9 +727,12 @@ static void apply_state(const string& state_str) {
                 groups_str.erase(0, pos + 1);
             }
             
-            // Update group files
+            // Merge group files
             pthread_mutex_lock(&group_files_mutex);
-            group_files = new_group_files; // Replace entire map to handle deletions
+            for (auto &kv : new_group_files) {
+                auto &dst = group_files[kv.first];
+                dst.insert(kv.second.begin(), kv.second.end());
+            }
             pthread_mutex_unlock(&group_files_mutex);
         }
         else if (type == "USER_CONNECTIONS") {
@@ -735,7 +756,10 @@ static void apply_state(const string& state_str) {
                 conns_str.erase(0, pos + 1);
             }
             pthread_mutex_lock(&user_ip_port_mutex);
-            user_ip_port = new_conns; // Replace entire map to reflect current live connections
+            // Merge: update/add incoming, keep existing locals not present in incoming
+            for (const auto &kv : new_conns) {
+                user_ip_port[kv.first] = kv.second;
+            }
             pthread_mutex_unlock(&user_ip_port_mutex);
         }
         else if (type == "USER_FILES") {
@@ -771,9 +795,12 @@ static void apply_state(const string& state_str) {
                 users_str.erase(0, pos + 1);
             }
             
-            // Update user files
+            // Merge user files
             pthread_mutex_lock(&user_files_mutex);
-            user_files = new_user_files; // Replace entire map to handle deletions
+            for (auto &kv : new_user_files) {
+                auto &dst = user_files[kv.first];
+                dst.insert(kv.second.begin(), kv.second.end());
+            }
             pthread_mutex_unlock(&user_files_mutex);
         }
         else if (type == "USER_DOWNLOADS") {

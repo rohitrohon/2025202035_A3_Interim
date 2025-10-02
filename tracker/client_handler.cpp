@@ -1,5 +1,6 @@
 #include "tracker.h"
 #include "client_handler.h"
+#include "synchronization.h"
 #include "data_structures.h"
 #include <sstream>
 #include <iostream>
@@ -7,9 +8,11 @@
 #include <unistd.h>
 #include <cstring>
 #include <fstream>
-#include <filesystem>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <chrono>
 #include <iomanip>
+#include <unordered_set>
 #include <openssl/sha.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -151,228 +154,214 @@ void handle_client(int client_sock, struct sockaddr_in client_addr) {
 }
 
 // Process individual commands
-void process_client_request(const string& command, int client_sock, 
+void process_client_request(const string& command, int client_sock,
                            string& client_user_id, const string& client_ip, int client_port) {
-    // Debug: Print raw command received
-    cout << "DEBUG: Raw command received: '" << command << "' (length: " << command.length() << ")" << endl;
-    cout << "DEBUG: Hex dump: ";
-    for (char c : command) {
-        cout << hex << setw(2) << setfill('0') << (int)(unsigned char)c << " ";
-    }
-    cout << dec << endl;
-
-    // Debug: Print the raw command with length
-    cout << "DEBUG: Raw command before trim: '" << command << "' (length: " << command.length() << ")" << endl;
-    
-    // Trim any leading/trailing whitespace including newlines
-    auto cmd_trimmed = command;
-    cmd_trimmed.erase(cmd_trimmed.find_last_not_of(" \t\n\r\f\v") + 1);
+    // Trim leading/trailing whitespace
+    string cmd_trimmed = command;
     cmd_trimmed.erase(0, cmd_trimmed.find_first_not_of(" \t\n\r\f\v"));
-    
-    cout << "DEBUG: Command after trim: '" << cmd_trimmed << "' (length: " << cmd_trimmed.length() << ")" << endl;
-    
-    istringstream ss(cmd_trimmed);
+    if (cmd_trimmed.empty()) return;
+    if (cmd_trimmed.find_last_not_of(" \t\n\r\f\v") != string::npos)
+        cmd_trimmed.erase(cmd_trimmed.find_last_not_of(" \t\n\r\f\v") + 1);
+
+    // Tokenize by spaces
+    istringstream iss(cmd_trimmed);
     vector<string> tokens;
-    string token;
-    
-    while (getline(ss, token, ' ')) {
-        // Trim each token to remove any remaining whitespace
-        token.erase(token.find_last_not_of(" \t\n\r\f\v") + 1);
-        token.erase(0, token.find_first_not_of(" \t\n\r\f\v"));
-        
-        if (!token.empty()) {
-            tokens.push_back(token);
-            cout << "DEBUG: Token: ['" << token << "'] (length: " << token.length() << ")" << endl;
-        }
-    }
-    
-    // Debug: Print all tokens
-    cout << "DEBUG: Found " << tokens.size() << " tokens" << endl;
-    
+    string tk;
+    while (iss >> tk) tokens.push_back(tk);
     if (tokens.empty()) {
-        const char* response = "Invalid command";
-        ::send(client_sock, response, strlen(response), 0);
+        send_response(client_sock, "Invalid command");
         return;
     }
-    
-    // Handle commands with spaces in them (e.g., "login user" -> "login_user")
+
+    // Normalize two-word commands like "create user" -> "create_user"
     string cmd = tokens[0];
-    
-    // First check if the command is already in the combined format (e.g., "list_groups")
-    if (cmd == "list_groups" || cmd == "create_user" || cmd == "create_group" || 
-        cmd == "join_group" || cmd == "list_requests" || cmd == "accept_request" || 
-        cmd == "leave_group") {
-        // Command is already in the correct format, use as is
-    }
-    // Handle multi-word commands by checking the second token (e.g., "list groups" -> "list_groups")
-    else if (tokens.size() > 1) {
-        string potential_cmd = tokens[0] + "_" + tokens[1];
-        // Check if this is a known command with underscore
-        if (potential_cmd == "create_user" || 
-            potential_cmd == "create_group" ||
-            potential_cmd == "list_groups" ||
-            potential_cmd == "join_group" ||
-            potential_cmd == "list_requests" ||
-            potential_cmd == "accept_request" ||
-            potential_cmd == "leave_group") {
-            
-            // Remove the second token and update the command
-            cmd = potential_cmd;
+    if (tokens.size() > 1) {
+        string combined = tokens[0] + "_" + tokens[1];
+        static const unordered_set<string> known = {
+            "create_user","create_group","list_groups","join_group","list_requests",
+            "accept_request","leave_group"
+        };
+        if (known.count(combined)) {
+            cmd = combined;
             tokens.erase(tokens.begin() + 1);
-            // The first token is now the combined command
             tokens[0] = cmd;
         }
     }
-    
-    // Route to appropriate command handler
+
+    // Dispatch
     if (cmd == "PORT" && tokens.size() == 2) {
-        // Handle PORT command (from client connection)
-        // Support both formats: "PORT <port>" and "PORT <ip>:<port>"
         string provided = tokens[1];
-        string provided_ip = client_ip; // default to remote IP
+        string provided_ip = client_ip;
         int client_listen_port = 0;
-        size_t colon_pos = provided.find(':');
-        if (colon_pos != string::npos) {
-            provided_ip = provided.substr(0, colon_pos);
-            client_listen_port = stoi(provided.substr(colon_pos + 1));
+        size_t colon = provided.find(':');
+        if (colon != string::npos) {
+            provided_ip = provided.substr(0, colon);
+            client_listen_port = stoi(provided.substr(colon + 1));
         } else {
             client_listen_port = stoi(provided);
         }
 
-        cout << "Client connected with source port: " << client_port 
-                  << " (listening on: " << provided_ip << ":" << client_listen_port << ")" << endl;
-        
-        // Store the client's listening port
-    pthread_mutex_lock(&socket_listen_port_mutex);
-    // Store the listen port and provided ip for this socket
-    socket_listen_port[client_sock] = client_listen_port;
-    socket_listen_ip[client_sock] = provided_ip;
-    pthread_mutex_unlock(&socket_listen_port_mutex);
+        cout << "Client connected with source port: " << client_port
+             << " (listening on: " << provided_ip << ":" << client_listen_port << ")" << endl;
 
-        // If the client already logged in, also update the user_ip_port mapping immediately
+        pthread_mutex_lock(&socket_listen_port_mutex);
+        socket_listen_port[client_sock] = client_listen_port;
+        socket_listen_ip[client_sock] = provided_ip;
+        pthread_mutex_unlock(&socket_listen_port_mutex);
+
         if (!client_user_id.empty()) {
             pthread_mutex_lock(&user_ip_port_mutex);
             user_ip_port[client_user_id] = make_pair(client_listen_port, provided_ip);
             pthread_mutex_unlock(&user_ip_port_mutex);
         }
-        
-        string response = "PORT_ACK\n";
-        ::send(client_sock, response.c_str(), response.length(), 0);
+
+        send_response(client_sock, "PORT_ACK");
         return;
-    } else if (cmd == "create_user") {
+    }
+
+    if (cmd == "create_user") {
         create_user(tokens, client_sock);
-    } else if (cmd == "login") {
+        return;
+    }
+    if (cmd == "login") {
         login_user(tokens, client_sock, client_user_id, client_port, client_ip);
-    } else if (cmd == "create_group") {
+        return;
+    }
+    if (cmd == "create_group") {
         create_group(tokens, client_sock, client_user_id);
-    } else if (cmd == "list_groups") {
+        return;
+    }
+    if (cmd == "list_groups") {
         list_groups(tokens, client_sock, client_user_id);
-    } else if (cmd == "logout") {
+        return;
+    }
+    if (cmd == "logout") {
         logout(tokens, client_sock, client_user_id);
-    } else if (cmd == "join_group") {
+        return;
+    }
+    if (cmd == "join_group") {
         join_group(tokens, client_sock, client_user_id);
-    } else if (cmd == "list_requests") {
+        return;
+    }
+    if (cmd == "list_requests") {
         list_requests(tokens, client_sock, client_user_id);
-    } else if (cmd == "accept_request") {
+        return;
+    }
+    if (cmd == "accept_request") {
         accept_request(tokens, client_sock, client_user_id);
-    } else if (cmd == "leave_group") {
+        return;
+    }
+    if (cmd == "leave_group") {
         leave_group(tokens, client_sock, client_user_id);
-    } else if (cmd == "upload_file") {
+        return;
+    }
+
+    // File-sharing related
+    if (cmd == "upload_file") {
         upload_file(tokens, client_sock, client_user_id);
-    } else if (cmd == "download_file") {
+        return;
+    }
+    if (cmd == "download_file") {
         download_file(tokens, client_sock, client_user_id);
-    } else if (cmd == "list_files") {
+        return;
+    }
+    if (cmd == "list_files") {
         list_files(tokens, client_sock, client_user_id);
-    } else if (cmd == "stop_share") {
+        return;
+    }
+    if (cmd == "stop_share") {
         stop_share(tokens, client_sock, client_user_id);
-    } else if (cmd == "show_downloads") {
-        // Build per-user download list response
-        string response;
+        return;
+    }
+
+    if (cmd == "show_downloads") {
+        // Return the download list for the logged-in user
+        if (client_user_id.empty()) {
+            send_response(client_sock, "ERROR: Please login first");
+            return;
+        }
         pthread_mutex_lock(&user_downloads_mutex);
+        string resp;
         auto it = user_downloads.find(client_user_id);
         if (it != user_downloads.end()) {
-            for (const auto &entry : it->second) {
-                // Format: [X] [group] filename
-                response += string("[") + entry.status + "] [" + entry.group_id + "] " + entry.file_name + "\n";
+            for (const auto &d : it->second) {
+                string line;
+                line += (d.status == 'D') ? "[D] " : "[C] ";
+                line += "[" + d.group_id + "] ";
+                line += d.file_name;
+                if (!resp.empty()) resp += "\n";
+                resp += line;
             }
         }
         pthread_mutex_unlock(&user_downloads_mutex);
-        if (response.empty()) response = "\n"; // send an empty line
-        send_response(client_sock, response);
-    } else if (cmd == "I_HAVE") {
-        // Format: I_HAVE <group_id> <client_id> <file_hash> <file_path>
-        if (tokens.size() >= 5) {
-            string group_id = tokens[1];
-            string announcing_client = tokens[2];
-            string file_hash = tokens[3];
-            string file_path = tokens[4];
-
-            // Add client to user_files
-            pthread_mutex_lock(&user_files_mutex);
-            user_files[announcing_client].insert(file_hash);
-            pthread_mutex_unlock(&user_files_mutex);
-
-            // Add file to group_files if missing
-            pthread_mutex_lock(&group_files_mutex);
-            group_files[group_id].insert(file_hash);
-            pthread_mutex_unlock(&group_files_mutex);
-
-            // Add client to chunk_owners for all chunks (if we know total_chunks)
-            pthread_mutex_lock(&file_metadata_mutex);
-            auto it = file_metadata.find(file_hash);
-            if (it != file_metadata.end()) {
-                FileInfo &fi = it->second;
-                // If total_chunks is known, add the client to every chunk
-                int tc = fi.total_chunks > 0 ? fi.total_chunks : 1;
-                for (int i = 0; i < tc; ++i) fi.chunk_owners[i].insert(announcing_client);
-                // Optionally update file_path if missing
-                if (fi.file_path.empty()) fi.file_path = file_path;
-            } else {
-                // Create a minimal FileInfo if the file is unknown
-                FileInfo fi;
-                fi.file_hash = file_hash;
-                fi.file_path = file_path;
-                fi.file_name = file_path.substr(file_path.find_last_of("/\\") + 1);
-                fi.owner_id = announcing_client;
-                fi.file_size = 0;
-                fi.total_chunks = 1;
-                fi.chunk_owners[0].insert(announcing_client);
-                file_metadata[file_hash] = fi;
-            }
-            pthread_mutex_unlock(&file_metadata_mutex);
-
-            // Mark user's download as completed (status 'C') for this file in this group
-            pthread_mutex_lock(&user_downloads_mutex);
-            try {
-                auto &vec = user_downloads[announcing_client];
-                for (auto &e : vec) {
-                    if (e.group_id == group_id) {
-                        // Match by name if we can resolve it
-                        pthread_mutex_lock(&file_metadata_mutex);
-                        string name_lookup;
-                        auto fmit = file_metadata.find(file_hash);
-                        if (fmit != file_metadata.end()) name_lookup = fmit->second.file_name;
-                        pthread_mutex_unlock(&file_metadata_mutex);
-                        if (!name_lookup.empty()) {
-                            if (e.file_name == name_lookup) e.status = 'C';
-                        }
-                    }
-                }
-            } catch (...) {}
-            pthread_mutex_unlock(&user_downloads_mutex);
-
-            send_response(client_sock, "SUCCESS: Announced availability");
-        } else {
-            send_response(client_sock, "ERROR: Invalid I_HAVE format");
-        }
-    } else if (cmd == "get_peers") {
-        get_peers(tokens, client_sock, client_user_id);
-    } else if (cmd == "update_file_metadata") {
-        update_file_metadata(tokens, client_sock, client_user_id);
-    } else {
-        string response = "Unknown command: " + cmd;
-        ::send(client_sock, response.c_str(), response.length(), 0);
+        if (resp.empty()) resp = "No downloads";
+        send_response(client_sock, resp);
+        return;
     }
+
+    if (cmd == "I_HAVE") {
+        // Format: I_HAVE <group_id> <client_id> <file_hash> <file_path>
+        if (tokens.size() < 5) { send_response(client_sock, "ERROR: Invalid I_HAVE format"); return; }
+        string group_id = tokens[1];
+        string announcing_client = tokens[2];
+        string file_hash = tokens[3];
+        string file_path = tokens[4];
+
+        pthread_mutex_lock(&user_files_mutex);
+        user_files[announcing_client].insert(file_hash);
+        pthread_mutex_unlock(&user_files_mutex);
+
+        pthread_mutex_lock(&group_files_mutex);
+        group_files[group_id].insert(file_hash);
+        pthread_mutex_unlock(&group_files_mutex);
+
+        pthread_mutex_lock(&file_metadata_mutex);
+        auto fit = file_metadata.find(file_hash);
+        if (fit != file_metadata.end()) {
+            FileInfo &fi = fit->second;
+            int tc = fi.total_chunks > 0 ? fi.total_chunks : 1;
+            for (int i = 0; i < tc; ++i) fi.chunk_owners[i].insert(announcing_client);
+            if (fi.file_path.empty()) fi.file_path = file_path;
+        } else {
+            FileInfo fi;
+            fi.file_hash = file_hash;
+            fi.file_path = file_path;
+            fi.file_name = file_path.substr(file_path.find_last_of("/\\") + 1);
+            fi.owner_id = announcing_client;
+            fi.file_size = 0;
+            fi.total_chunks = 1;
+            fi.chunk_owners[0].insert(announcing_client);
+            file_metadata[file_hash] = fi;
+        }
+        pthread_mutex_unlock(&file_metadata_mutex);
+
+        // Mark as completed in user_downloads if present
+        pthread_mutex_lock(&user_downloads_mutex);
+        try {
+            auto &vec = user_downloads[announcing_client];
+            for (auto &e : vec) {
+                if (e.group_id == group_id) {
+                    pthread_mutex_lock(&file_metadata_mutex);
+                    string name_lookup;
+                    auto fm = file_metadata.find(file_hash);
+                    if (fm != file_metadata.end()) name_lookup = fm->second.file_name;
+                    pthread_mutex_unlock(&file_metadata_mutex);
+                    if (!name_lookup.empty() && e.file_name == name_lookup) e.status = 'C';
+                }
+            }
+        } catch (...) {}
+        pthread_mutex_unlock(&user_downloads_mutex);
+
+        force_sync();
+        send_response(client_sock, "SUCCESS: Announced availability");
+        return;
+    }
+
+    if (cmd == "get_peers") { get_peers(tokens, client_sock, client_user_id); return; }
+    if (cmd == "update_file_metadata") { update_file_metadata(tokens, client_sock, client_user_id); return; }
+
+    // Unknown
+    send_response(client_sock, string("Unknown command: ") + cmd);
 }
 
 /* tracker_loop is defined in tracker.cpp */
@@ -405,6 +394,9 @@ void upload_file(const vector<string>& tokens, int client_sock, const string& cl
         pthread_mutex_lock(&group_members_mutex);
         user_in_group = (group_members[group_id].find(client_user_id) != group_members[group_id].end());
         pthread_mutex_unlock(&group_members_mutex);
+    
+    // Force sync so membership and pending requests changes propagate immediately
+    force_sync();
     }
 
     if (!user_in_group) {
@@ -425,10 +417,9 @@ void upload_file(const vector<string>& tokens, int client_sock, const string& cl
     
     // Get the actual file size
     struct stat stat_buf;
-    if (stat(file_path.c_str(), &stat_buf) == 0) {
-        file_info.file_size = stat_buf.st_size;
-        cout << "DEBUG: Got file size: " << file_info.file_size << " bytes" << endl;
-    } else {
+        if (stat(file_path.c_str(), &stat_buf) == 0) {
+            file_info.file_size = stat_buf.st_size;
+        } else {
         cerr << "WARNING: Could not get file size for " << file_path << ": " << strerror(errno) << endl;
         file_info.file_size = 0;
     }
@@ -439,32 +430,27 @@ void upload_file(const vector<string>& tokens, int client_sock, const string& cl
         file_info.chunk_owners[0].insert(client_user_id);  // Using chunk 0 as a placeholder
     }
 
-    // Update data structures with temporary file ID - lock in consistent order to prevent deadlocks
+    // Update data structures with temporary file ID
+    // Important: do NOT insert temp into group_files/user_files to avoid leaking temps
     pthread_mutex_lock(&file_metadata_mutex);
-    pthread_mutex_lock(&group_files_mutex);
-    pthread_mutex_lock(&user_files_mutex);
-    
     try {
         file_metadata[temp_file_id] = file_info;
-        group_files[group_id].insert(temp_file_id);
-        user_files[client_user_id].insert(temp_file_id);
-        
-        pthread_mutex_unlock(&user_files_mutex);
-        pthread_mutex_unlock(&group_files_mutex);
         pthread_mutex_unlock(&file_metadata_mutex);
     } catch (...) {
-        // Ensure mutexes are always unlocked, even if an exception occurs
-        pthread_mutex_unlock(&user_files_mutex);
-        pthread_mutex_unlock(&group_files_mutex);
         pthread_mutex_unlock(&file_metadata_mutex);
-        throw; // Re-throw the exception
+        throw;
     }
+    // Record temp associations for finalize step
+    pthread_mutex_lock(&temp_maps_mutex);
+    temp_to_group[temp_file_id] = group_id;
+    temp_to_owner[temp_file_id] = client_user_id;
+    pthread_mutex_unlock(&temp_maps_mutex);
+    // Recorded temp mapping for finalize step
 
     // Instruct client to process the file and provide metadata
     // Include the file name and size in the response
     // Format: PROCESS_FILE <temp_file_id> <file_name> <file_size>
     string response = "PROCESS_FILE " + temp_file_id + " " + file_name + " " + to_string(file_info.file_size);
-    cout << "DEBUG: Sending response to client: " << response << endl;
     send_response(client_sock, response);
 }
 
@@ -500,32 +486,70 @@ void download_file(const vector<string>& tokens, int client_sock, const string& 
     // First try to find by hash
     auto file_it = file_metadata.find(file_hash);
     
-    // If not found by hash, try to find by filename
+    // If not found by hash, try to find by filename, preferring finalized entries
     if (file_it == file_metadata.end()) {
-        cout << "DEBUG: File not found by hash, trying to find by name: " << file_hash << endl;
+    // File not found by hash, trying to find by name
+        string chosen_hash;
+        // First pass: non-temp entries only
         for (const auto& [hash, info] : file_metadata) {
-            if (info.file_name == file_hash) {  // Using file_hash as filename in this case
-                cout << "DEBUG: Found file by name: " << info.file_name 
-                     << " with hash: " << hash << endl;
-                file_it = file_metadata.find(hash);
-                found = true;
+            if (hash.rfind("temp_", 0) != 0 && info.file_name == file_hash) {
+                chosen_hash = hash;
                 break;
             }
         }
+        // Second pass: allow temp if no finalized found
+        if (chosen_hash.empty()) {
+            for (const auto& [hash, info] : file_metadata) {
+                if (info.file_name == file_hash) {
+                    chosen_hash = hash;
+                    break;
+                }
+            }
+        }
+        if (!chosen_hash.empty()) {
+            // Found file by name
+            file_it = file_metadata.find(chosen_hash);
+            found = true;
+        }
         if (!found) {
             pthread_mutex_unlock(&file_metadata_mutex);
-            cout << "DEBUG: File not found by name either: " << file_hash << endl;
+            // File not found by name either
             send_response(client_sock, "ERROR: File not found");
             return;
         }
     }
     
-    // Check if file is still in temp state
+    // Check if file is still in temp state; try to resolve to finalized entry by same name
     if (file_it->first.find("temp_") == 0) {
-        pthread_mutex_unlock(&file_metadata_mutex);
-        cout << "DEBUG: File found but still in temp state: " << file_it->first << endl;
-        send_response(client_sock, "ERROR: File is still being processed. Please try again in a moment.");
-        return;
+        string temp_name = file_it->second.file_name;
+    // File found in temp state, attempting resolve by name
+        bool resolved = false;
+        for (const auto &kv : file_metadata) {
+            if (kv.first.rfind("temp_", 0) != 0 && kv.second.file_name == temp_name) {
+                // Found a finalized entry for same name
+                file_it = file_metadata.find(kv.first);
+                resolved = true;
+                break;
+            }
+        }
+        if (!resolved) {
+            // Try forcing a sync and re-check once
+            pthread_mutex_unlock(&file_metadata_mutex);
+            force_sync();
+            pthread_mutex_lock(&file_metadata_mutex);
+            for (const auto &kv : file_metadata) {
+                if (kv.first.rfind("temp_", 0) != 0 && kv.second.file_name == temp_name) {
+                    file_it = file_metadata.find(kv.first);
+                    resolved = true;
+                    break;
+                }
+            }
+        }
+        if (!resolved) {
+            pthread_mutex_unlock(&file_metadata_mutex);
+            send_response(client_sock, "ERROR: File not yet available; metadata not finalized");
+            return;
+        }
     }
     
     file_info = file_it->second; // Make a copy while holding the lock
@@ -539,13 +563,6 @@ void download_file(const vector<string>& tokens, int client_sock, const string& 
         pthread_mutex_lock(&file_metadata_mutex);
         auto file_it = file_metadata.find(file_hash);
         if (file_it != file_metadata.end()) {
-            // If file is still in temp state, it's not ready for download
-            if (file_it->first.find("temp_") == 0) {
-                pthread_mutex_unlock(&file_metadata_mutex);
-                send_response(client_sock, "ERROR: File is still being processed. Please try again in a moment.");
-                return;
-            }
-            
             for (const auto& [chunk_num, clients] : file_it->second.chunk_owners) {
                 for (const string& peer_id : clients) {
                     string peer_addr = get_client_address(peer_id);
@@ -626,33 +643,41 @@ void list_files(const vector<string>& tokens, int client_sock, const string& cli
     try {
         auto group_it = group_files.find(group_id);
         if (group_it != group_files.end()) {
-            for (const auto& file_hash : group_it->second) {
-                auto file_it = file_metadata.find(file_hash);
-                if (file_it == file_metadata.end()) {
-                    cerr << "WARNING: File hash found in group but not in metadata: " << file_hash << endl;
+            // Deduplicate by filename to avoid duplicate rows if both temp and finalized exist
+            unordered_set<string> seen_names;
+            // Snapshot hashes to avoid mutating during iteration
+            vector<string> hashes(group_it->second.begin(), group_it->second.end());
+            for (const auto& h : hashes) {
+                auto it = file_metadata.find(h);
+                if (it == file_metadata.end()) {
+                    cerr << "WARNING: File hash found in group but not in metadata: " << h << endl;
                     continue;
                 }
-                
-                const FileInfo& file_info = file_it->second;
-                
-                // Skip if file is still in temp state
-                if (file_hash.find("temp_") == 0) {
-                    cout << "DEBUG: Skipping temp file: " << file_hash << endl;
-                    continue;
+
+                const FileInfo* info_ptr = &it->second;
+                string name = info_ptr->file_name;
+
+                // If temp, try to resolve to finalized entry by same name
+                if (h.rfind("temp_", 0) == 0) {
+                    // Skipping temp file
+                    for (const auto &kv : file_metadata) {
+                        if (kv.first.rfind("temp_", 0) != 0 && kv.second.file_name == name) {
+                            info_ptr = &kv.second;
+                            name = info_ptr->file_name;
+                            break;
+                        }
+                    }
                 }
-                
-                // Add file info to the response lines: name size total_chunks
-                if (!file_list.empty()) {
-                    file_list += "\n";
-                }
-                file_list += file_info.file_name + " " + to_string(file_info.file_size) + " " + to_string(file_info.total_chunks);
+
+                // If already listed by name, skip to avoid duplicates
+                if (seen_names.count(name)) continue;
+                seen_names.insert(name);
+
+                if (!file_list.empty()) file_list += "\n";
+                file_list += name + " " + to_string(info_ptr->file_size) + " " + to_string(info_ptr->total_chunks);
                 file_count++;
-                
-                // Debug output
-                cout << "DEBUG: Listing file - "
-                     << "Name: " << file_info.file_name
-                     << ", Size: " << file_info.file_size
-                     << ", Chunks: " << file_info.total_chunks << endl;
+
+             // Listing file - name/size/chunks
             }
         }
         
@@ -716,10 +741,10 @@ void stop_share(const vector<string>& tokens, int client_sock, const string& cli
                 break;
             }
         }
+        pthread_mutex_unlock(&file_metadata_mutex);
         pthread_mutex_unlock(&group_files_mutex);
         if (!found) {
-            pthread_mutex_unlock(&file_metadata_mutex);
-            send_response(client_sock, "ERROR: File not found");
+            send_response(client_sock, "ERROR: File not found in metadata");
             return;
         }
     }
@@ -766,11 +791,7 @@ void stop_share(const vector<string>& tokens, int client_sock, const string& cli
 
 void update_file_metadata(const vector<string>& tokens, int client_sock, const string& client_user_id) {
     // Format: update_file_metadata <temp_file_id> <file_hash> <file_size> <total_chunks> [<chunk_hash1> <chunk_hash2> ...]
-    cout << "DEBUG: update_file_metadata called with tokens: ";
-    for (const auto& t : tokens) {
-        cout << t << " ";
-    }
-    cout << endl;
+    // update_file_metadata called
 
     if (tokens.size() < 5) {
         string error = "ERROR: Invalid command format. Expected at least 5 tokens, got " + to_string(tokens.size());
@@ -787,7 +808,6 @@ void update_file_metadata(const vector<string>& tokens, int client_sock, const s
     try {
         file_size = stoull(tokens[3]);
         total_chunks = stoi(tokens[4]);
-        cout << "DEBUG: Parsed file_size: " << file_size << ", total_chunks: " << total_chunks << endl;
     } catch (const exception& e) {
         string error = "ERROR: Invalid file size or chunk count: " + string(e.what());
         cout << error << endl;
@@ -800,13 +820,10 @@ void update_file_metadata(const vector<string>& tokens, int client_sock, const s
     
     try {
         // Find the temporary file
-        cout << "DEBUG: Looking for temp file ID: " << temp_file_id << endl;
+        // Looking for temp file ID
         auto it = file_metadata.find(temp_file_id);
         if (it == file_metadata.end()) {
-            cout << "DEBUG: Temp file not found in file_metadata, current keys: " << endl;
-            for (const auto& entry : file_metadata) {
-                cout << "  - " << entry.first << endl;
-            }
+            // Temp file not found in file_metadata
             pthread_mutex_unlock(&file_metadata_mutex);
             send_response(client_sock, "ERROR: File not found or already updated");
             return;
@@ -815,12 +832,7 @@ void update_file_metadata(const vector<string>& tokens, int client_sock, const s
         // Get the file info
         FileInfo file_info = it->second;
         
-        cout << "DEBUG: Found file info - "
-             << "Name: " << file_info.file_name
-             << ", Old Size: " << file_info.file_size
-             << ", New Size: " << file_size
-             << ", Old Hash: " << file_info.file_hash
-             << ", New Hash: " << file_hash << endl;
+        // Found file info - updating metadata
         
         // Update with actual metadata
         file_info.file_hash = file_hash;
@@ -839,19 +851,60 @@ void update_file_metadata(const vector<string>& tokens, int client_sock, const s
         }
 
         // Remove the old entry
-        cout << "DEBUG: Removing temp file entry: " << temp_file_id << endl;
+        // Removing temp file entry
         file_metadata.erase(it);
         
         // Add with the actual file hash as the key
-        cout << "DEBUG: Adding new file entry with hash: " << file_hash << endl;
+        // Adding new file entry with hash
         file_metadata[file_hash] = file_info;
         
         // Debug output
-        cout << "DEBUG: Updated file metadata - "
-                  << "Name: " << file_info.file_name
-                  << ", Size: " << file_info.file_size
-                  << ", Hash: " << file_info.file_hash
-                  << ", Chunks: " << file_info.total_chunks << endl;
+        // Updated file metadata
+        // Option A cleanup: purge any lingering temp_* entries with the same file_name
+        {
+            vector<string> temps_to_remove;
+            for (const auto &kv : file_metadata) {
+                if (kv.first.rfind("temp_", 0) == 0 && kv.second.file_name == file_info.file_name) {
+                    temps_to_remove.push_back(kv.first);
+                }
+            }
+            if (!temps_to_remove.empty()) {
+                // Purging temp entries for this file_name
+            }
+            // Remove from mappings first, then erase from metadata
+                if (!temps_to_remove.empty()) {
+                pthread_mutex_lock(&user_files_mutex);
+                for (auto &uf : user_files) {
+                    for (const string &tk : temps_to_remove) {
+                        if (uf.second.erase(tk) > 0) {
+                            uf.second.insert(file_hash);
+                        }
+                    }
+                }
+                pthread_mutex_unlock(&user_files_mutex);
+
+                pthread_mutex_lock(&group_files_mutex);
+                for (auto &gf : group_files) {
+                    bool touched = false;
+                    for (const string &tk : temps_to_remove) {
+                        if (gf.second.erase(tk) > 0) {
+                            touched = true;
+                        }
+                    }
+                    if (touched) {
+                        gf.second.insert(file_hash);
+                    }
+                }
+                pthread_mutex_unlock(&group_files_mutex);
+
+                // Finally, erase from file_metadata (keep current finalized entry)
+                for (const string &tk : temps_to_remove) {
+                    if (tk != temp_file_id) {
+                        file_metadata.erase(tk);
+                    }
+                }
+            }
+        }
         
         // Unlock file_metadata_mutex before locking others to prevent deadlocks
         pthread_mutex_unlock(&file_metadata_mutex);
@@ -864,17 +917,23 @@ void update_file_metadata(const vector<string>& tokens, int client_sock, const s
                 if (files.erase(temp_file_id) > 0) {
                     files.insert(file_hash);
                     user_updated = true;
-                    cout << "DEBUG: Updated user files mapping for user: " << user_id << endl;
+                    if (user_updated) {
+                        // Updated user files mapping for user
+                    }
                 }
             }
             
             if (!user_updated) {
-                cout << "WARNING: File " << temp_file_id << " not found in any user's file list" << endl;
                 // Add to the owner's file list if not already there
-                if (!file_info.owner_id.empty()) {
-                    user_files[file_info.owner_id].insert(file_hash);
-                    cout << "DEBUG: Added file " << file_hash << " to owner's file list: " 
-                         << file_info.owner_id << endl;
+                string owner = file_info.owner_id;
+                if (owner.empty()) {
+                    pthread_mutex_lock(&temp_maps_mutex);
+                    auto to = temp_to_owner.find(temp_file_id);
+                    if (to != temp_to_owner.end()) owner = to->second;
+                    pthread_mutex_unlock(&temp_maps_mutex);
+                }
+                if (!owner.empty()) {
+                    user_files[owner].insert(file_hash);
                 }
             }
             
@@ -892,12 +951,21 @@ void update_file_metadata(const vector<string>& tokens, int client_sock, const s
                 if (files.erase(temp_file_id) > 0) {
                     files.insert(file_hash);
                     group_updated = true;
-                    cout << "DEBUG: Updated group files mapping for group: " << group_id << endl;
                 }
             }
             
             if (!group_updated) {
-                cout << "WARNING: File " << temp_file_id << " not found in any group's file list" << endl;
+                // Insert into the original group from temp mapping (always add finalized)
+                string gins;
+                pthread_mutex_lock(&temp_maps_mutex);
+                auto tgit = temp_to_group.find(temp_file_id);
+                if (tgit != temp_to_group.end()) gins = tgit->second;
+                pthread_mutex_unlock(&temp_maps_mutex);
+                if (!gins.empty()) {
+                    group_files[gins].insert(file_hash);
+                } else {
+                    // File not found in any group's file list and no temp mapping
+                }
             }
             
             pthread_mutex_unlock(&group_files_mutex);
@@ -905,13 +973,21 @@ void update_file_metadata(const vector<string>& tokens, int client_sock, const s
             pthread_mutex_unlock(&group_files_mutex);
             throw;
         }
+
+        // Erase temp-to-* mappings for this temp_id now that finalize is done
+        pthread_mutex_lock(&temp_maps_mutex);
+        temp_to_group.erase(temp_file_id);
+        temp_to_owner.erase(temp_file_id);
+        pthread_mutex_unlock(&temp_maps_mutex);
         
         // At this point, all mappings have been updated
-        cout << "DEBUG: Successfully updated all mappings for file " << file_info.file_name 
-             << " (old temp ID: " << temp_file_id << ", new hash: " << file_hash << ")" << endl;
+        // Successfully updated all mappings for file
         
         // Send success response
         send_response(client_sock, "SUCCESS: File metadata updated successfully");
+
+        // Trigger immediate sync so other tracker sees the finalized entry and seeders
+        force_sync();
     } catch (const exception& e) {
         // Ensure file_metadata_mutex is always unlocked
         pthread_mutex_unlock(&file_metadata_mutex);
@@ -1159,6 +1235,9 @@ void create_group(const vector<string>& tokens, int client_sock, const string& c
     pthread_mutex_unlock(&group_admin_mutex);
     pthread_mutex_unlock(&all_groups_mutex);
     
+    // Force sync so other tracker sees the new group immediately
+    force_sync();
+
     ::send(client_sock, response.c_str(), response.length(), 0);
 }
 
@@ -1238,12 +1317,15 @@ void join_group(const vector<string>& tokens, int client_sock, const string& cli
             pthread_mutex_lock(&pending_requests_mutex);
             pending_requests[group_id].insert(client_user_id);
             pthread_mutex_unlock(&pending_requests_mutex);
-            response = "Join request sent to group admin";
+            response = "Join request sent";
         }
         pthread_mutex_unlock(&group_members_mutex);
+        // Force sync so the pending request is visible on the other tracker immediately
+        force_sync();
+        
+        ::send(client_sock, response.c_str(), response.length(), 0);
+        return;
     }
-    
-    ::send(client_sock, response.c_str(), response.length(), 0);
 }
 
 void list_requests(const vector<string>& tokens, int client_sock, const string& client_user_id) {
@@ -1343,8 +1425,8 @@ void accept_request(const vector<string>& tokens, int client_sock, const string&
             group_join_times[group_id][millis] = user_id;
             pthread_mutex_unlock(&group_join_times_mutex);
             
-            // The pending_requests change will be synchronized in the next sync cycle
-            
+            // Force sync so the addition and pending_requests removal propagate immediately
+            force_sync();
             response = "User added to the group";
         }
         pthread_mutex_unlock(&pending_requests_mutex);
@@ -1405,6 +1487,8 @@ void leave_group(const vector<string>& tokens, int client_sock, const string& cl
             pthread_mutex_unlock(&pending_requests_mutex);
             
             response = "You were the last member. Group has been deleted.";
+            // Propagate deletion immediately
+            force_sync();
         } else {
             // Find the next oldest member
             string new_admin;
@@ -1437,6 +1521,8 @@ void leave_group(const vector<string>& tokens, int client_sock, const string& cl
                 }
                 
                 response = "You have left the group. Admin rights transferred to " + new_admin;
+                // Propagate admin transfer immediately
+                force_sync();
             } else {
                 response = "Error: Could not find a new admin. Group may be in an inconsistent state.";
             }

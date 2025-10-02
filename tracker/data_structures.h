@@ -62,6 +62,11 @@ extern pthread_mutex_t file_metadata_mutex;
 extern pthread_mutex_t user_files_mutex;
 extern pthread_mutex_t user_downloads_mutex;
 
+// Temp upload tracking (to avoid leaking temp_* into user/group maps)
+extern unordered_map<string, string> temp_to_group; // temp_id -> group_id
+extern unordered_map<string, string> temp_to_owner; // temp_id -> user_id
+extern pthread_mutex_t temp_maps_mutex;
+
 // Initialize all mutexes
 void initialize_mutexes();
 

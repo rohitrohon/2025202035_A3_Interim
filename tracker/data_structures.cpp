@@ -37,6 +37,11 @@ unordered_map<string, FileInfo> file_metadata;   // file_hash -> FileInfo
 unordered_map<string, set<string>> user_files;   // user_id -> set of file_hashes
 unordered_map<string, vector<DownloadEntry>> user_downloads; // user_id -> downloads
 
+// Temp upload tracking maps
+unordered_map<string, string> temp_to_group; // temp_id -> group_id
+unordered_map<string, string> temp_to_owner; // temp_id -> user_id
+pthread_mutex_t temp_maps_mutex;
+
 void initialize_mutexes() {
     // Initialize existing mutexes
     pthread_mutex_init(&user_data_mutex, NULL);
@@ -53,6 +58,7 @@ void initialize_mutexes() {
     pthread_mutex_init(&file_metadata_mutex, NULL);
     pthread_mutex_init(&user_files_mutex, NULL);
     pthread_mutex_init(&user_downloads_mutex, NULL);
+    pthread_mutex_init(&temp_maps_mutex, NULL);
 }
 
 void destroy_mutexes() {
@@ -71,4 +77,5 @@ void destroy_mutexes() {
     pthread_mutex_destroy(&file_metadata_mutex);
     pthread_mutex_destroy(&user_files_mutex);
     pthread_mutex_destroy(&user_downloads_mutex);
+    pthread_mutex_destroy(&temp_maps_mutex);
 }

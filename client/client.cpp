@@ -23,19 +23,18 @@
 #include <netdb.h>
 #include <fstream>
 #include <algorithm>
-#include <filesystem>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <set>
 #include <atomic>
 #include <openssl/sha.h>
 
 using namespace std;
-using namespace std::filesystem;
 
 // Validate and sanitize file path to prevent directory traversal
 bool is_valid_path(const std::string& path) {
     // Disallow parent-directory traversal. Allow absolute and relative paths.
     if (path.empty() || path.find("../") != std::string::npos) {
-        std::cerr << "DEBUG: is_valid_path rejected path: '" << path << "'" << std::endl;
         return false;
     }
     return true;
@@ -69,13 +68,6 @@ void handle_peer_connection(int peer_sock) {
     
     buffer[valread] = '\0';
     string request = string(buffer);
-    // Debug: log the raw peer request
-    std::cout << "DEBUG: Peer request received: '" << request << "' (len=" << valread << ")" << std::endl;
-    std::cout << "DEBUG: Peer request hex: ";
-    for (int i = 0; i < std::min((ssize_t)valread, (ssize_t)128); ++i) {
-        std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)buffer[i] << " ";
-    }
-    std::cout << std::dec << std::endl;
     
     // Parse request: format "filepath$chunkno$nchunks"
     size_t one = request.find('$');
@@ -113,10 +105,9 @@ void handle_peer_connection(int peer_sock) {
     }
     
     // Open file with error handling
-    std::cout << "DEBUG: Attempting to open file for peer request: '" << filepath << "'" << std::endl;
     int file = open(filepath.c_str(), O_RDONLY);
     if (file < 0) {
-        std::cerr << "DEBUG: open() failed for '" << filepath << "': " << strerror(errno) << std::endl;
+        std::cerr << "open() failed for '" << filepath << "': " << strerror(errno) << std::endl;
         send_error_response(peer_sock, "File not found or permission denied");
         close(peer_sock);
         return;
@@ -209,10 +200,7 @@ void handle_peer_connection(int peer_sock) {
         }
     }
     
-    if (totalBytesSent > 0) {
-        cout << "\nSent " << totalBytesSent << " bytes of file " << filepath 
-             << " (chunk " << chunkno << ")" << endl;
-    } else {
+    if (totalBytesSent <= 0) {
         cerr << "No data sent for file: " << filepath << endl;
     }
     
@@ -318,8 +306,9 @@ void start_listening(int listen_port) {
             char client_ip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &address.sin_addr, client_ip, INET_ADDRSTRLEN);
             
-            cout << "New connection from " << client_ip << ":" << ntohs(address.sin_port) << endl;
-            
+            // Suppressed: New connection logging to avoid noisy output during downloads
+            // cout << "New connection from " << client_ip << ":" << ntohs(address.sin_port) << endl;
+
             // Create a new thread to handle the connection
             try {
                 thread(handle_peer_connection, new_socket).detach();
@@ -529,25 +518,23 @@ int main(int argc, char *argv[]) {
                 string group_id = pre_toks[1];
                 string file_name = pre_toks[2];
                 string dest_path = pre_toks[3];
-                cout << "DEBUG: Running local download_file via FileShareManager" << endl;
+                // Running local download_file via FileShareManager
                 bool ok = fsm->download_file(group_id, file_name, dest_path);
                 if (!ok) cout << "Download failed." << endl;
             }
             continue; // skip sending the command to the tracker
         }
 
-        // Do not intercept show_downloads; let it go to tracker
+        // Handle show_downloads locally
+        if (!pre_toks.empty() && pre_toks[0] == "show_downloads" && fsm) {
+            fsm->show_downloads();
+            continue; // skip sending to tracker
+        }
 
         // Send the command with a newline terminator
         string command_to_send = command + "\n";
         
-        // Debug: Print what we're about to send
-        cout << "DEBUG: Sending command: '" << command_to_send << "' (length: " << command_to_send.length() << ")" << endl;
-        cout << "DEBUG: Hex dump: ";
-        for (char c : command_to_send) {
-            cout << hex << setw(2) << setfill('0') << (int)(unsigned char)c << " ";
-        }
-        cout << dec << endl;
+        // send command to tracker
         
         ssize_t total_sent = 0;
         ssize_t bytes_sent;
@@ -563,16 +550,25 @@ int main(int argc, char *argv[]) {
             total_sent += bytes_sent;
         }
         
-        // Read and display the response
+        // Read and display the response (with a short timeout)
+        // Wait up to 2s for tracker to respond to avoid hanging on commands like show_downloads
+        {
+            fd_set rfds; FD_ZERO(&rfds); FD_SET(sock, &rfds);
+            struct timeval rtv; rtv.tv_sec = 2; rtv.tv_usec = 0;
+            int ready = select(sock + 1, &rfds, nullptr, nullptr, &rtv);
+            if (ready <= 0) {
+                cout << "(no response from tracker)" << endl;
+                continue;
+            }
+        }
         char response[1024] = {0};
         ssize_t valread = recv(sock, response, sizeof(response) - 1, 0);
-        
         if (valread <= 0) {
             cout << "Tracker disconnected!" << endl;
             break;
         }
 
-        string resp_str(response);
+        string resp_str(response, (size_t)valread);
         cout << resp_str;
         if (!resp_str.empty() && resp_str.back() != '\n') cout << endl;
 

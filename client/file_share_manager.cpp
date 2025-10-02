@@ -19,7 +19,9 @@
 #include <sys/types.h>
 #include <vector>
 #include <dirent.h>
-#include <filesystem>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <cstdio>
 #include <queue>
 #include <functional>
 #include <condition_variable>
@@ -362,14 +364,11 @@ bool FileShareManager::upload_file(const string& group_id,
             command += " " + c.hash;
         }
 
-        cout << "DEBUG: Sending update_file_metadata command: " << command << endl;
         if (send(sock, (command + "\n").c_str(), command.length() + 1, MSG_NOSIGNAL) <= 0) {
             close(sock);
             throw runtime_error("Failed to send file metadata");
         }
-
         response = recv_line(sock);
-        cout << "DEBUG: Received response to update_file_metadata: " << response << endl;
     if (sock_owned) close(sock);
         
         if (response.find("SUCCESS") == 0) {
@@ -510,10 +509,19 @@ bool FileShareManager::download_file(const string& group_id,
             string p; if (!(iss >> p)) break; peers.push_back(p);
         }
         
-        // Step 2: Create download directory if it doesn't exist
-        filesystem::path dest_dir = filesystem::path(dest_path).parent_path();
-        if (!dest_dir.empty() && !filesystem::exists(dest_dir)) {
-            filesystem::create_directories(dest_dir);
+        // Step 2: Create download directory if it doesn't exist (POSIX)
+        size_t path_pos = dest_path.find_last_of("/\\");
+        if (path_pos != string::npos) {
+            string parent = dest_path.substr(0, path_pos);
+            // recursive mkdir -p
+            string cur;
+            for (size_t i = 0; i < parent.size(); ++i) {
+                cur += parent[i];
+                if (parent[i] == '/' || i + 1 == parent.size()) {
+                    if (cur.empty()) continue;
+                    mkdir(cur.c_str(), 0777);
+                }
+            }
         }
         
         // Step 3: Prepare download info
@@ -563,21 +571,14 @@ bool FileShareManager::download_file(const string& group_id,
             }
         }
 
-        // Debug: print parsed info
-    cout << "DEBUG: Parsed FILE_INFO - file='" << file_name_recv << "' size=" << file_size
-                  << " total_chunks=" << total_chunks << " num_peers=" << num_peers << endl;
-        cout << "DEBUG: Peers list (" << peers.size() << "):";
-        for (const auto &p : peers) cout << " '" << p << "'";
-        cout << endl;
-        if (!chunk_hashes.empty()) {
-            cout << "DEBUG: Received " << chunk_hashes.size() << " chunk hashes" << endl;
-        } else {
-            cout << "DEBUG: No per-chunk hashes provided by tracker" << endl;
-        }
+        // parsed FILE_INFO and peers
 
         // Prepare temp dir for chunks
-        filesystem::path temp_dir = filesystem::path("./chunks") / (file_name_recv + "_chunks_tmp_") / to_string(time(nullptr));
-        filesystem::create_directories(temp_dir);
+    // Build temporary chunk dir: ./chunks/<file>_chunks_tmp_<ts>
+    string temp_dir = string("./chunks/") + file_name_recv + string("_chunks_tmp_") + to_string(time(nullptr));
+    // Ensure parent ./chunks exists and create temp dir
+    mkdir("./chunks", 0777);
+    mkdir(temp_dir.c_str(), 0777);
 
         // Thread pool sizing: use hardware concurrency but cap to 16 threads
         unsigned int hw = thread::hardware_concurrency();
@@ -628,7 +629,7 @@ bool FileShareManager::download_file(const string& group_id,
                         continue;
                     }
 
-                    string chunk_path = (temp_dir / ("chunk_" + to_string(chunkno))).string();
+                    string chunk_path = temp_dir + string("/chunk_") + to_string(chunkno);
                     ofstream out(chunk_path, ios::binary);
                     if (!out) { close(psock); continue; }
 
@@ -644,8 +645,8 @@ bool FileShareManager::download_file(const string& group_id,
 
                     if (total_received <= 0) {
                         // nothing received
-                        error_code ec;
-                        filesystem::remove(chunk_path, ec);
+                        // remove the partial chunk file
+                        ::remove(chunk_path.c_str());
                         continue;
                     }
 
@@ -654,7 +655,7 @@ bool FileShareManager::download_file(const string& group_id,
                     if (!expected.empty()) {
                         bool ok = verify_chunk(chunk_path, expected);
                         if (!ok) {
-                            error_code ec; filesystem::remove(chunk_path, ec);
+                            ::remove(chunk_path.c_str());
                             continue;
                         }
                     }
@@ -687,7 +688,7 @@ bool FileShareManager::download_file(const string& group_id,
         }
 
         // Combine chunks
-        string final_temp_dir = temp_dir.string();
+    string final_temp_dir = temp_dir;
         if (!combine_chunks(dest_path, final_temp_dir, total_chunks)) {
             throw runtime_error("Failed to combine chunks");
         }
@@ -702,7 +703,10 @@ bool FileShareManager::download_file(const string& group_id,
         // Announce ourselves as a new seeder to the tracker (if we know the file hash)
         if (!file_hash_recv.empty() && file_hash_recv != "-") {
             try {
-                (void)announce_share(info.group_id, file_hash_recv, dest_path);
+                bool announced = announce_share(info.group_id, file_hash_recv, dest_path);
+                if (announced) {
+                    cout << "Added as a seeder for " << file_name << endl;
+                }
             } catch (...) {
                 // Non-fatal; continue even if announce fails
             }
