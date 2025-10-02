@@ -24,10 +24,12 @@
 #include <functional>
 #include <condition_variable>
 #include <atomic>
+#include <random>
+#include <numeric>
 
 using namespace std;
 
-const size_t CHUNK_SIZE = 512 * 1024; // 512 KB fixed chunk size
+// CHUNK_SIZE is now defined in file_operations.h
 
 // Global control socket (if the interactive client registered one)
 static int g_control_socket = -1;
@@ -587,17 +589,28 @@ bool FileShareManager::download_file(const string& group_id,
         atomic<int> completed_chunks{0};
         atomic<bool> cancel_flag{false};
 
-        // For each chunk, submit a download task
-        for (int chunkno = 0; chunkno < total_chunks; ++chunkno) {
+        // Prepare shuffled list of chunk indices for improved peer utilization
+        vector<int> chunk_indices(total_chunks);
+        iota(chunk_indices.begin(), chunk_indices.end(), 0);
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::shuffle(chunk_indices.begin(), chunk_indices.end(), gen);
+
+        // For each chunk (in shuffled order), submit a download task
+        for (int chunkno : chunk_indices) {
             string expected_hash = (chunkno < (int)chunk_hashes.size()) ? chunk_hashes[chunkno] : string();
 
             // capture file_path_recv and file_name_recv by value for use inside lambda
-            pool.submit([this, &peers, chunkno, expected_hash, &temp_dir, &completed_chunks, &failed_chunks, &cancel_flag, &download_id, file_path_recv, file_name_recv]() {
+            pool.submit([this, &peers, chunkno, expected_hash, &temp_dir, &completed_chunks, &failed_chunks, &cancel_flag, &download_id, file_path_recv, file_name_recv, gen]() mutable {
                 if (cancel_flag.load()) return;
 
                 bool chunk_ok = false;
-                // Try peers in order
-                for (const auto& peer : peers) {
+                // Randomize peer order per chunk for better distribution
+                vector<string> peers_shuffled = peers;
+                std::shuffle(peers_shuffled.begin(), peers_shuffled.end(), gen);
+
+                // Try peers in randomized order
+                for (const auto& peer : peers_shuffled) {
                     if (cancel_flag.load()) break;
                     // peer format ip:port
                     size_t colon = peer.find(':');
@@ -680,9 +693,18 @@ bool FileShareManager::download_file(const string& group_id,
         }
 
         // Verify final file hash if provided by FILE_INFO
-        if (!file_hash_recv.empty()) {
+        if (!file_hash_recv.empty() && file_hash_recv != "-") {
             if (!verify_file_integrity(dest_path, file_hash_recv)) {
                 throw runtime_error("Final file hash mismatch");
+            }
+        }
+
+        // Announce ourselves as a new seeder to the tracker (if we know the file hash)
+        if (!file_hash_recv.empty() && file_hash_recv != "-") {
+            try {
+                (void)announce_share(info.group_id, file_hash_recv, dest_path);
+            } catch (...) {
+                // Non-fatal; continue even if announce fails
             }
         }
 
@@ -804,7 +826,8 @@ void FileShareManager::show_downloads() const {
 
     // Print completed entries with [C]
     for (const auto& [id, info] : completed_downloads) {
-        cout << "[C] [" << info.group_id << "] " << info.file_name << " - Completed" << endl;
+        // Exact required format: [C] [group id] filename
+        cout << "[C] [" << info.group_id << "] " << info.file_name << endl;
     }
 }
 

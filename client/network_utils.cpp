@@ -6,6 +6,10 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <iostream>
+#include <fcntl.h>
+#include <poll.h>
+#include <errno.h>
+#include <cstring>
 
 using namespace std;
 
@@ -121,12 +125,39 @@ int connect_to_tracker(const string& ip, int port, const string& client_info) {
         return -1;
     }
 
-    // Connect to the tracker
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("connect");
-        close(sock);
-        return -1;
+    // Set non-blocking for connect timeout handling
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags == -1) flags = 0;
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    int ret = connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr));
+    if (ret < 0) {
+        if (errno != EINPROGRESS) {
+            // Immediate failure
+            // perror("connect");
+            close(sock);
+            return -1;
+        }
+        // Wait for connect to complete with timeout
+        struct pollfd pfd;
+        pfd.fd = sock;
+        pfd.events = POLLOUT;
+        int pres = poll(&pfd, 1, 2000); // 2s timeout
+        if (pres <= 0) {
+            // Timeout or error
+            close(sock);
+            return -1;
+        }
+        // Check for socket error
+        int so_error = 0; socklen_t slen = sizeof(so_error);
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &slen) < 0 || so_error != 0) {
+            close(sock);
+            return -1;
+        }
     }
+
+    // Restore blocking mode
+    fcntl(sock, F_SETFL, flags);
 
     // If client_info is provided, send it to the tracker
     if (!client_info.empty()) {
@@ -139,7 +170,11 @@ int connect_to_tracker(const string& ip, int port, const string& client_info) {
             return -1;
         }
         
-        // Wait for PORT_ACK response
+        // Set a short receive timeout for PORT_ACK
+        struct timeval tv; tv.tv_sec = 2; tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        // Wait for PORT_ACK response (with timeout)
         char ack_buffer[32] = {0};
         ssize_t bytes_received = recv(sock, ack_buffer, sizeof(ack_buffer) - 1, 0);
         if (bytes_received <= 0) {
@@ -147,8 +182,8 @@ int connect_to_tracker(const string& ip, int port, const string& client_info) {
             return -1;
         }
         
-            // Check if we got a PORT_ACK
-        if (strncmp(ack_buffer, "PORT_ACK", 7) != 0) {
+        // Check if we got a PORT_ACK
+        if (strncmp(ack_buffer, "PORT_ACK", 8) != 0) {
             std::cerr << "Did not receive PORT_ACK from tracker" << std::endl;
             close(sock);
             return -1;

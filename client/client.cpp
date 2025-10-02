@@ -24,6 +24,8 @@
 #include <fstream>
 #include <algorithm>
 #include <filesystem>
+#include <set>
+#include <atomic>
 #include <openssl/sha.h>
 
 using namespace std;
@@ -44,6 +46,10 @@ void send_error_response(int sock, const std::string& message) {
     std::string response = "ERROR: " + message + "\n";
     send(sock, response.c_str(), response.length(), 0);
 }
+
+// Global listener control
+static std::atomic<bool> g_listen_run{true};
+static int g_server_fd = -1;
 
 // Handle a single peer connection with improved security and error handling
 void handle_peer_connection(int peer_sock) {
@@ -218,40 +224,40 @@ void handle_peer_connection(int peer_sock) {
 
 // Start listening for incoming peer connections
 void start_listening(int listen_port) {
-    int server_fd, new_socket;
+    int new_socket;
     struct sockaddr_in address;
     int opt = 1;
     socklen_t addrlen = sizeof(address);
     
     // Create socket file descriptor
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+    if ((g_server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         cerr << "Socket creation failed: " << strerror(errno) << endl;
         return;
     }
     
     // Set socket options: set SO_REUSEADDR and (where available) SO_REUSEPORT separately
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+    if (setsockopt(g_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         cerr << "Warning: setsockopt(SO_REUSEADDR) failed: " << strerror(errno) << endl;
         // Not fatal, continue
     }
 #ifdef SO_REUSEPORT
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+    if (setsockopt(g_server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
         // Some platforms may not support SO_REUSEPORT; log but don't fatal
         cerr << "Note: setsockopt(SO_REUSEPORT) failed or not supported: " << strerror(errno) << endl;
     }
 #endif
     
     // Set non-blocking mode
-    int flags = fcntl(server_fd, F_GETFL, 0);
+    int flags = fcntl(g_server_fd, F_GETFL, 0);
     if (flags == -1) {
         cerr << "F_GETFL failed: " << strerror(errno) << endl;
-        close(server_fd);
+        close(g_server_fd);
         return;
     }
     
-    if (fcntl(server_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+    if (fcntl(g_server_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
         cerr << "F_SETFL O_NONBLOCK failed: " << strerror(errno) << endl;
-        close(server_fd);
+        close(g_server_fd);
         return;
     }
     
@@ -260,26 +266,26 @@ void start_listening(int listen_port) {
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(static_cast<uint16_t>(listen_port));
     
-    if (::bind(server_fd, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) < 0) {
+    if (::bind(g_server_fd, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) < 0) {
         cerr << "Bind failed: " << strerror(errno) << endl;
-        close(server_fd);
+        close(g_server_fd);
         return;
     }
     
     // Start listening
-    if (listen(server_fd, SOMAXCONN) < 0) {
+    if (listen(g_server_fd, SOMAXCONN) < 0) {
         cerr << "Listen failed: " << strerror(errno) << endl;
-        close(server_fd);
+        close(g_server_fd);
         return;
     }
     
     cout << "Listening for incoming connections on port " << listen_port << "..." << endl;
     
     struct pollfd fds[1];
-    fds[0].fd = server_fd;
+    fds[0].fd = g_server_fd;
     fds[0].events = POLLIN;
     
-    while (true) {
+    while (g_listen_run.load()) {
         // Wait for activity on the server socket with a timeout
         int activity = poll(fds, 1, 1000); // 1 second timeout
         
@@ -295,7 +301,7 @@ void start_listening(int listen_port) {
         // Check if there's an incoming connection
         if (fds[0].revents & POLLIN) {
             // Accept the connection
-            new_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen);
+            new_socket = accept(g_server_fd, (struct sockaddr *)&address, &addrlen);
             if (new_socket < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     continue; // No pending connections
@@ -325,7 +331,10 @@ void start_listening(int listen_port) {
     }
     
     // Cleanup
-    close(server_fd);
+    if (g_server_fd >= 0) {
+        close(g_server_fd);
+        g_server_fd = -1;
+    }
 }
 
 // get_file_name_from_path is defined in file_operations.cpp
@@ -352,7 +361,7 @@ int main(int argc, char *argv[]) {
     thread listening_thread(start_listening, listen_port);
     listening_thread.detach();
     
-    // Read tracker info from file
+    // Read tracker info from client file and merge with tracker/tracker_info.txt to deduplicate
     int fd = open(tracker_filename.c_str(), O_RDONLY);
     if (fd < 0) {
         cerr << "Failed to open " << tracker_filename << endl;
@@ -373,29 +382,52 @@ int main(int argc, char *argv[]) {
     
     stringstream ss(buffer);
     string line;
+    
+    // Build an ordered, de-duplicated list of trackers (preserve client file order)
+    vector<string> tracker_list;
+    unordered_set<string> seen;
+    while (getline(ss, line)) {
+        // trim whitespace
+        line.erase(line.begin(), std::find_if(line.begin(), line.end(), [](int ch){ return !std::isspace(ch); }));
+        line.erase(std::find_if(line.rbegin(), line.rend(), [](int ch){ return !std::isspace(ch); }).base(), line.end());
+        if (!line.empty() && !seen.count(line)) { tracker_list.push_back(line); seen.insert(line); }
+    }
+
+    // Optionally merge in tracker-side file entries after client entries (preserve relative order)
+    {
+        const char* tracker_side = "../tracker/tracker_info.txt";
+        ifstream tin(tracker_side);
+        if (tin) {
+            string tline;
+            while (getline(tin, tline)) {
+                tline.erase(tline.begin(), std::find_if(tline.begin(), tline.end(), [](int ch){ return !std::isspace(ch); }));
+                tline.erase(std::find_if(tline.rbegin(), tline.rend(), [](int ch){ return !std::isspace(ch); }).base(), tline.end());
+                if (!tline.empty() && !seen.count(tline)) { tracker_list.push_back(tline); seen.insert(tline); }
+            }
+        }
+    }
+
+    // tracker_list now contains ordered, de-duplicated trackers; do not rewrite file
     int sock = -1;
     string connected_tracker;
     // FileShareManager will be created once we connect to a tracker
     std::unique_ptr<FileShareManager> fsm;
     
     // Try each tracker in sequence until one connects successfully
-    while (getline(ss, line)) {
-        // Skip empty lines
-        if (line.empty()) continue;
-        
+    for (const string& line_ep : tracker_list) {
         // Parse tracker IP and port
-        size_t colon_pos = line.find(':');
+        size_t colon_pos = line_ep.find(':');
         if (colon_pos == string::npos || colon_pos == 0) {
-            cout << "Invalid format in tracker info file: " << line << endl;
+            cout << "Invalid format in tracker info file: " << line_ep << endl;
             continue;
         }
 
-        string track_ip = line.substr(0, colon_pos);
+        string track_ip = line_ep.substr(0, colon_pos);
         int track_port;
         try {
-            track_port = stoi(line.substr(colon_pos + 1));
+            track_port = stoi(line_ep.substr(colon_pos + 1));
         } catch (const std::exception& e) {
-            cout << "Invalid port number in tracker info: " << line << endl;
+            cout << "Invalid port number in tracker info: " << line_ep << endl;
             continue;
         }
         
@@ -504,11 +536,7 @@ int main(int argc, char *argv[]) {
             continue; // skip sending the command to the tracker
         }
 
-        // Local show_downloads command (also accept "show downloads")
-    if ( ( (!pre_toks.empty() && pre_toks[0] == "show_downloads") || (!pre_toks.empty() && pre_toks[0] == "show" && pre_toks.size() > 1 && pre_toks[1] == "downloads") ) && fsm) {
-            fsm->show_downloads();
-            continue;
-        }
+        // Do not intercept show_downloads; let it go to tracker
 
         // Send the command with a newline terminator
         string command_to_send = command + "\n";
@@ -628,6 +656,14 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    // Stop listener gracefully
+    g_listen_run.store(false);
+    if (g_server_fd >= 0) {
+        shutdown(g_server_fd, SHUT_RDWR);
+        close(g_server_fd);
+        g_server_fd = -1;
+    }
+
     close(sock);
     return 0;
 }

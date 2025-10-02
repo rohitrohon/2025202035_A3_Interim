@@ -285,6 +285,20 @@ void process_client_request(const string& command, int client_sock,
         list_files(tokens, client_sock, client_user_id);
     } else if (cmd == "stop_share") {
         stop_share(tokens, client_sock, client_user_id);
+    } else if (cmd == "show_downloads") {
+        // Build per-user download list response
+        string response;
+        pthread_mutex_lock(&user_downloads_mutex);
+        auto it = user_downloads.find(client_user_id);
+        if (it != user_downloads.end()) {
+            for (const auto &entry : it->second) {
+                // Format: [X] [group] filename
+                response += string("[") + entry.status + "] [" + entry.group_id + "] " + entry.file_name + "\n";
+            }
+        }
+        pthread_mutex_unlock(&user_downloads_mutex);
+        if (response.empty()) response = "\n"; // send an empty line
+        send_response(client_sock, response);
     } else if (cmd == "I_HAVE") {
         // Format: I_HAVE <group_id> <client_id> <file_hash> <file_path>
         if (tokens.size() >= 5) {
@@ -326,6 +340,26 @@ void process_client_request(const string& command, int client_sock,
                 file_metadata[file_hash] = fi;
             }
             pthread_mutex_unlock(&file_metadata_mutex);
+
+            // Mark user's download as completed (status 'C') for this file in this group
+            pthread_mutex_lock(&user_downloads_mutex);
+            try {
+                auto &vec = user_downloads[announcing_client];
+                for (auto &e : vec) {
+                    if (e.group_id == group_id) {
+                        // Match by name if we can resolve it
+                        pthread_mutex_lock(&file_metadata_mutex);
+                        string name_lookup;
+                        auto fmit = file_metadata.find(file_hash);
+                        if (fmit != file_metadata.end()) name_lookup = fmit->second.file_name;
+                        pthread_mutex_unlock(&file_metadata_mutex);
+                        if (!name_lookup.empty()) {
+                            if (e.file_name == name_lookup) e.status = 'C';
+                        }
+                    }
+                }
+            } catch (...) {}
+            pthread_mutex_unlock(&user_downloads_mutex);
 
             send_response(client_sock, "SUCCESS: Announced availability");
         } else {
@@ -539,6 +573,18 @@ void download_file(const vector<string>& tokens, int client_sock, const string& 
     sort(peers.begin(), peers.end());
     peers.erase(unique(peers.begin(), peers.end()), peers.end());
 
+    // Before responding, record this user's download status as 'D' (downloading)
+    {
+        pthread_mutex_lock(&user_downloads_mutex);
+        bool found = false;
+        auto &vec = user_downloads[client_user_id];
+        for (auto &e : vec) {
+            if (e.group_id == group_id && e.file_name == file_info.file_name) { e.status = 'D'; found = true; break; }
+        }
+        if (!found) vec.push_back(DownloadEntry{group_id, file_info.file_name, 'D'});
+        pthread_mutex_unlock(&user_downloads_mutex);
+    }
+
     // Send response with file info, peers, and chunk hashes (if available)
     // Format: FILE_INFO <file_path> <file_name> <file_hash> <file_size> <total_chunks> <num_peers> <peer1> ... [chunk_hashes...]
     // Ensure we send a placeholder for file_hash if missing to keep token positions stable
@@ -624,46 +670,92 @@ void list_files(const vector<string>& tokens, int client_sock, const string& cli
 }
 
 void stop_share(const vector<string>& tokens, int client_sock, const string& client_user_id) {
+    // Accept: stop_share <group_id> <file_name_or_hash>
     if (tokens.size() < 3) {
-        send_response(client_sock, "ERROR: Invalid command format. Use: stop_share <group_id> <file_hash>");
+        send_response(client_sock, "ERROR: Invalid command format. Use: stop_share <group_id> <file_name>");
         return;
     }
 
     string group_id = tokens[1];
-    string file_hash = tokens[2];
+    string file_key = tokens[2]; // can be hash or name
 
-    // Check if user is the owner of the file
-    pthread_mutex_lock(&file_metadata_mutex);
-    auto file_it = file_metadata.find(file_hash);
-    if (file_it == file_metadata.end() || file_it->second.owner_id != client_user_id) {
-        pthread_mutex_unlock(&file_metadata_mutex);
-        send_response(client_sock, "ERROR: You are not the owner of this file or file does not exist");
+    // Ensure user is a member of the group
+    bool user_in_group = false;
+    pthread_mutex_lock(&group_members_mutex);
+    user_in_group = (group_members[group_id].find(client_user_id) != group_members[group_id].end());
+    pthread_mutex_unlock(&group_members_mutex);
+    if (!user_in_group) {
+        send_response(client_sock, "ERROR: You are not a member of this group");
         return;
+    }
+
+    // Resolve file: try by hash, else by name within metadata and group
+    string file_hash = file_key;
+    pthread_mutex_lock(&file_metadata_mutex);
+    auto it = file_metadata.find(file_key);
+    if (it == file_metadata.end()) {
+        // find by name: ensure it's part of this group
+        // check group_files for candidates
+        pthread_mutex_unlock(&file_metadata_mutex);
+        pthread_mutex_lock(&group_files_mutex);
+        auto gf_it = group_files.find(group_id);
+        if (gf_it == group_files.end()) {
+            pthread_mutex_unlock(&group_files_mutex);
+            send_response(client_sock, "ERROR: File not found in this group");
+            return;
+        }
+        // try to match filename
+        bool found = false;
+        pthread_mutex_lock(&file_metadata_mutex);
+        for (const auto& fh : gf_it->second) {
+            auto fm_it = file_metadata.find(fh);
+            if (fm_it != file_metadata.end() && fm_it->second.file_name == file_key) {
+                file_hash = fh;
+                it = fm_it;
+                found = true;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&group_files_mutex);
+        if (!found) {
+            pthread_mutex_unlock(&file_metadata_mutex);
+            send_response(client_sock, "ERROR: File not found");
+            return;
+        }
+    }
+
+    // Remove this user from seeders list (chunk_owners) for all chunks
+    try {
+        FileInfo &fi = it->second;
+        for (auto &entry : fi.chunk_owners) {
+            entry.second.erase(client_user_id);
+        }
+    } catch (...) {
+        // Ensure mutex gets unlocked below
     }
     pthread_mutex_unlock(&file_metadata_mutex);
 
-    // Remove from group files
-    pthread_mutex_lock(&group_files_mutex);
-    group_files[group_id].erase(file_hash);
-    pthread_mutex_unlock(&group_files_mutex);
-
-    // Remove from user files
+    // Remove mapping from user_files
     pthread_mutex_lock(&user_files_mutex);
     user_files[client_user_id].erase(file_hash);
     pthread_mutex_unlock(&user_files_mutex);
 
-    // If no more references, remove file metadata
-    bool has_references = false;
-    pthread_mutex_lock(&group_files_mutex);
-    for (const auto& [_, files] : group_files) {
-        if (files.find(file_hash) != files.end()) {
-            has_references = true;
-            break;
+    // If no seeders remain for any chunk, remove file from group and metadata
+    bool any_seeder = false;
+    pthread_mutex_lock(&file_metadata_mutex);
+    auto fit2 = file_metadata.find(file_hash);
+    if (fit2 != file_metadata.end()) {
+        for (const auto &entry : fit2->second.chunk_owners) {
+            if (!entry.second.empty()) { any_seeder = true; break; }
         }
     }
-    pthread_mutex_unlock(&group_files_mutex);
+    pthread_mutex_unlock(&file_metadata_mutex);
 
-    if (!has_references) {
+    if (!any_seeder) {
+        pthread_mutex_lock(&group_files_mutex);
+        group_files[group_id].erase(file_hash);
+        pthread_mutex_unlock(&group_files_mutex);
+
         pthread_mutex_lock(&file_metadata_mutex);
         file_metadata.erase(file_hash);
         pthread_mutex_unlock(&file_metadata_mutex);

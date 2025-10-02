@@ -8,6 +8,9 @@
 
 using namespace std;
 
+// Fixed chunk size (512 KB)
+static constexpr size_t CHUNK_SIZE = 512 * 1024;
+
 // --------------------------------------------
 // Structures for metadata
 // --------------------------------------------

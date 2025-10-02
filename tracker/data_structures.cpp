@@ -29,11 +29,13 @@ pthread_mutex_t user_ip_port_mutex;
 pthread_mutex_t group_files_mutex;
 pthread_mutex_t file_metadata_mutex;
 pthread_mutex_t user_files_mutex;
+pthread_mutex_t user_downloads_mutex;
 
 // File sharing data structures
 unordered_map<string, set<string>> group_files;  // group_id -> set of file_hashes
 unordered_map<string, FileInfo> file_metadata;   // file_hash -> FileInfo
 unordered_map<string, set<string>> user_files;   // user_id -> set of file_hashes
+unordered_map<string, vector<DownloadEntry>> user_downloads; // user_id -> downloads
 
 void initialize_mutexes() {
     // Initialize existing mutexes
@@ -50,6 +52,7 @@ void initialize_mutexes() {
     pthread_mutex_init(&group_files_mutex, NULL);
     pthread_mutex_init(&file_metadata_mutex, NULL);
     pthread_mutex_init(&user_files_mutex, NULL);
+    pthread_mutex_init(&user_downloads_mutex, NULL);
 }
 
 void destroy_mutexes() {
@@ -67,4 +70,5 @@ void destroy_mutexes() {
     pthread_mutex_destroy(&group_files_mutex);
     pthread_mutex_destroy(&file_metadata_mutex);
     pthread_mutex_destroy(&user_files_mutex);
+    pthread_mutex_destroy(&user_downloads_mutex);
 }

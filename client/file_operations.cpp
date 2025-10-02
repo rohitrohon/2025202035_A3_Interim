@@ -12,7 +12,7 @@
 
 using namespace std;
 
-const size_t CHUNK_SIZE = 512 * 1024; // 512 KB fixed chunk size
+// CHUNK_SIZE is defined in file_operations.h
 
 // --------------------------------------------
 // SHA1 calculation helpers

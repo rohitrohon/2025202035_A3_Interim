@@ -38,6 +38,14 @@ extern unordered_map<string, set<string>> group_files;  // group_id -> set of fi
 extern unordered_map<string, FileInfo> file_metadata;  // file_hash -> FileInfo
 extern unordered_map<string, set<string>> user_files;  // user_id -> set of file_hashes
 
+// Download tracking per user
+struct DownloadEntry {
+    string group_id;
+    string file_name;
+    char status; // 'D' or 'C'
+};
+extern unordered_map<string, vector<DownloadEntry>> user_downloads; // user_id -> list of downloads
+
 // Mutexes for thread safety
 extern pthread_mutex_t user_data_mutex;
 extern pthread_mutex_t login_mutex;
@@ -52,6 +60,7 @@ extern pthread_mutex_t user_ip_port_mutex;
 extern pthread_mutex_t group_files_mutex;
 extern pthread_mutex_t file_metadata_mutex;
 extern pthread_mutex_t user_files_mutex;
+extern pthread_mutex_t user_downloads_mutex;
 
 // Initialize all mutexes
 void initialize_mutexes();

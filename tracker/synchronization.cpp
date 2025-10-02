@@ -354,6 +354,16 @@ static string serialize_state() {
             }
             ss << "]";
         }
+
+        // Serialize chunk hashes (optional section prefixed by H[...])
+        if (!file_info.chunk_hashes.empty()) {
+            ss << "H[";
+            for (size_t i = 0; i < file_info.chunk_hashes.size(); ++i) {
+                ss << file_info.chunk_hashes[i];
+                if (i + 1 < file_info.chunk_hashes.size()) ss << ",";
+            }
+            ss << "]";
+        }
         ss << ";";
     }
     ss << "}\n";
@@ -384,6 +394,20 @@ static string serialize_state() {
     }
     ss << "}\n";
     pthread_mutex_unlock(&user_files_mutex);
+
+    // Serialize user downloads mapping
+    pthread_mutex_lock(&user_downloads_mutex);
+    ss << "USER_DOWNLOADS:{";
+    for (const auto& [user_id, entries] : user_downloads) {
+        ss << user_id << "=";
+        for (const auto& e : entries) {
+            // Encode as group|file|status and separate multiple with commas
+            ss << e.group_id << "|" << e.file_name << "|" << e.status << ",";
+        }
+        ss << ";";
+    }
+    ss << "}\n";
+    pthread_mutex_unlock(&user_downloads_mutex);
     
     return ss.str();
 }
@@ -597,32 +621,47 @@ static void apply_state(const string& state_str) {
                         info.owner_id = parts[4];
                         info.total_chunks = stoi(parts[5]);
                         
-                        // Parse chunk owners if present
+                        // Parse chunk owners and optional chunk hashes (H[...]) if present
                         if (parts.size() > 6) {
-                            string chunk_data = parts[6];
+                            string mixed_data = parts[6];
+
+                            // Detect optional hashes block starting with 'H['
+                            string owners_part = mixed_data;
+                            string hashes_part;
+                            size_t hpos = mixed_data.find("H[");
+                            if (hpos != string::npos) {
+                                owners_part = mixed_data.substr(0, hpos);
+                                size_t hend = mixed_data.find(']', hpos + 2);
+                                if (hend != string::npos) {
+                                    hashes_part = mixed_data.substr(hpos + 2, hend - (hpos + 2));
+                                }
+                            }
+
+                            // Parse owners_part
                             size_t chunk_start = 0;
-                            
-                            while (chunk_start < chunk_data.length()) {
-                                size_t chunk_num_end = chunk_data.find('[', chunk_start);
+                            while (chunk_start < owners_part.length()) {
+                                size_t chunk_num_end = owners_part.find('[', chunk_start);
                                 if (chunk_num_end == string::npos) break;
-                                
-                                int chunk_num = stoi(chunk_data.substr(chunk_start, chunk_num_end - chunk_start));
+                                int chunk_num = stoi(owners_part.substr(chunk_start, chunk_num_end - chunk_start));
                                 size_t owners_start = chunk_num_end + 1;
-                                size_t owners_end = chunk_data.find(']', owners_start);
-                                
+                                size_t owners_end = owners_part.find(']', owners_start);
                                 if (owners_end == string::npos) break;
-                                
-                                string owners_str = chunk_data.substr(owners_start, owners_end - owners_start);
+                                string owners_str = owners_part.substr(owners_start, owners_end - owners_start);
                                 stringstream owners_ss(owners_str);
                                 string owner;
-                                
                                 while (getline(owners_ss, owner, ',')) {
-                                    if (!owner.empty()) {
-                                        info.chunk_owners[chunk_num].insert(owner);
-                                    }
+                                    if (!owner.empty()) info.chunk_owners[chunk_num].insert(owner);
                                 }
-                                
                                 chunk_start = owners_end + 1;
+                            }
+
+                            // Parse hashes_part if present
+                            if (!hashes_part.empty()) {
+                                stringstream hs(hashes_part);
+                                string h;
+                                while (getline(hs, h, ',')) {
+                                    if (!h.empty()) info.chunk_hashes.push_back(h);
+                                }
                             }
                         }
                         
@@ -675,6 +714,30 @@ static void apply_state(const string& state_str) {
             group_files = new_group_files; // Replace entire map to handle deletions
             pthread_mutex_unlock(&group_files_mutex);
         }
+        else if (type == "USER_CONNECTIONS") {
+            // Format: {user=ip:port;user2=ip:port;}
+            string conns_str = content.substr(1, content.length() - 2);
+            unordered_map<string, pair<int,string>> new_conns;
+            size_t pos = 0;
+            while ((pos = conns_str.find(';')) != string::npos) {
+                string entry = conns_str.substr(0, pos);
+                size_t eq_pos = entry.find('=');
+                if (eq_pos != string::npos) {
+                    string user = entry.substr(0, eq_pos);
+                    string addr = entry.substr(eq_pos + 1);
+                    size_t colon = addr.find(':');
+                    if (!user.empty() && colon != string::npos) {
+                        string ip = addr.substr(0, colon);
+                        int port = atoi(addr.substr(colon + 1).c_str());
+                        if (!ip.empty() && port > 0) new_conns[user] = make_pair(port, ip);
+                    }
+                }
+                conns_str.erase(0, pos + 1);
+            }
+            pthread_mutex_lock(&user_ip_port_mutex);
+            user_ip_port = new_conns; // Replace entire map to reflect current live connections
+            pthread_mutex_unlock(&user_ip_port_mutex);
+        }
         else if (type == "USER_FILES") {
             // Format: {user1=file1,file2;user2=file3,file4;...}
             string users_str = content.substr(1, content.length() - 2);
@@ -712,6 +775,42 @@ static void apply_state(const string& state_str) {
             pthread_mutex_lock(&user_files_mutex);
             user_files = new_user_files; // Replace entire map to handle deletions
             pthread_mutex_unlock(&user_files_mutex);
+        }
+        else if (type == "USER_DOWNLOADS") {
+            // Format: {user=group|file|status,group|file|status;...}
+            string all_str = content.substr(1, content.length() - 2);
+            unordered_map<string, vector<DownloadEntry>> new_user_dl;
+            size_t pos = 0;
+            while ((pos = all_str.find(';')) != string::npos) {
+                string entry = all_str.substr(0, pos);
+                size_t eq_pos = entry.find('=');
+                if (eq_pos != string::npos) {
+                    string user = entry.substr(0, eq_pos);
+                    string items = entry.substr(eq_pos + 1);
+                    vector<DownloadEntry> list;
+                    size_t cpos = 0;
+                    while ((cpos = items.find(',')) != string::npos) {
+                        string item = items.substr(0, cpos);
+                        if (!item.empty()) {
+                            size_t p1 = item.find('|');
+                            size_t p2 = (p1==string::npos)?string::npos:item.find('|', p1+1);
+                            if (p1 != string::npos && p2 != string::npos && p2+1 <= item.size()) {
+                                DownloadEntry de;
+                                de.group_id = item.substr(0, p1);
+                                de.file_name = item.substr(p1+1, p2 - (p1+1));
+                                de.status = item.substr(p2+1)[0];
+                                list.push_back(de);
+                            }
+                        }
+                        items.erase(0, cpos + 1);
+                    }
+                    if (!user.empty()) new_user_dl[user] = list;
+                }
+                all_str.erase(0, pos + 1);
+            }
+            pthread_mutex_lock(&user_downloads_mutex);
+            user_downloads = new_user_dl; // Replace entire map to handle deletions
+            pthread_mutex_unlock(&user_downloads_mutex);
         }
     }
 }
