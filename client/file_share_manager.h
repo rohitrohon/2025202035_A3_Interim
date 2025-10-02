@@ -55,6 +55,10 @@ public:
 
     // Allow caller to provide an already-open control socket (e.g., interactive client)
     void set_control_socket(int sock);
+    // Set client id (user id) for messages that require authentication
+    void set_client_id(const std::string& id);
+    // Announce that this client now has a file (after download) so tracker can add it as a peer
+    bool announce_share(const std::string& group_id, const std::string& file_hash, const std::string& file_path) const;
 
     // Getters
     const FileMetadata* get_file_metadata(const std::string& file_name) const;
@@ -75,11 +79,14 @@ private:
     struct DownloadInfo {
         std::string file_name;
         std::string dest_path;
+        std::string group_id;
         int total_chunks;
         int downloaded_chunks;
         std::chrono::system_clock::time_point start_time;
     };
     std::unordered_map<std::string, DownloadInfo> active_downloads;
+    // Completed downloads history
+    std::unordered_map<std::string, DownloadInfo> completed_downloads;
     
     // Thread safety
     mutable std::mutex shared_files_mutex;

@@ -27,31 +27,23 @@
 #include <mutex>
 #include <map>
 
+using namespace std;
+
 // External declarations from data_structures.cpp
-extern std::unordered_map<std::string, std::map<long long, std::string>> group_join_times;
+extern unordered_map<string, map<long long, string>> group_join_times;
 extern pthread_mutex_t group_join_times_mutex;
 
-// Forward declarations for socket functions to avoid conflicts
-extern "C" {
-    int accept(int, struct sockaddr*, socklen_t*);
-    int bind(int, const struct sockaddr*, socklen_t);
-    int connect(int, const struct sockaddr*, socklen_t);
-    int socket(int, int, int);
-    int close(int);
-}
-
 // Using declarations for standard library components we use
-using std::string;
-using std::vector;
 
 // Map socket fd -> client's listening port (from PORT command)
-static std::unordered_map<int,int> socket_listen_port;
+static unordered_map<int,int> socket_listen_port;
+static unordered_map<int,string> socket_listen_ip;
 static pthread_mutex_t socket_listen_port_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Send a response to a client
-void send_response(int client_sock, const std::string& response) {
+void send_response(int client_sock, const string& response) {
     // Add newline if not present
-    std::string response_with_newline = response;
+    string response_with_newline = response;
     if (!response_with_newline.empty() && response_with_newline.back() != '\n') {
         response_with_newline += "\n";
     }
@@ -64,7 +56,7 @@ void send_response(int client_sock, const std::string& response) {
 }
 
 // Get client address string from user_id (ip:port)
-std::string get_client_address(const std::string& user_id) {
+string get_client_address(const string& user_id) {
     // Lock the user IP/port map
     pthread_mutex_lock(&user_ip_port_mutex);
     
@@ -76,7 +68,7 @@ std::string get_client_address(const std::string& user_id) {
     }
     
     // Format the address as ip:port
-    std::string address = it->second.second + ":" + std::to_string(it->second.first);
+    string address = it->second.second + ":" + to_string(it->second.first);
     
     pthread_mutex_unlock(&user_ip_port_mutex);
     return address;
@@ -92,7 +84,7 @@ void handle_client(int client_sock, struct sockaddr_in client_addr) {
     string client_user_id;
     string client_ip = inet_ntoa(client_addr.sin_addr);
     int client_port = ntohs(client_addr.sin_port);
-    std::string inbuf;
+    string inbuf;
 
     while (true) {
         ssize_t bytes_received = recv(client_sock, tmpbuf, sizeof(tmpbuf), 0);
@@ -120,16 +112,16 @@ void handle_client(int client_sock, struct sockaddr_in client_addr) {
 
         // Extract full lines terminated by '\n'
         size_t pos;
-        while ((pos = inbuf.find('\n')) != std::string::npos) {
-            std::string line = inbuf.substr(0, pos);
+        while ((pos = inbuf.find('\n')) != string::npos) {
+            string line = inbuf.substr(0, pos);
             // Remove optional CR
             if (!line.empty() && line.back() == '\r') line.pop_back();
 
             // Trim whitespace at ends
             size_t first = line.find_first_not_of(" \t\r\n");
             size_t last = line.find_last_not_of(" \t\r\n");
-            if (first != std::string::npos && last != std::string::npos) {
-                std::string cmd = line.substr(first, last - first + 1);
+            if (first != string::npos && last != string::npos) {
+                string cmd = line.substr(first, last - first + 1);
                 if (!cmd.empty()) {
                     process_client_request(cmd, client_sock, client_user_id, client_ip, client_port);
                 }
@@ -149,6 +141,12 @@ void handle_client(int client_sock, struct sockaddr_in client_addr) {
     }
     
     // Close the client socket
+    // Cleanup socket -> listen port mapping
+    pthread_mutex_lock(&socket_listen_port_mutex);
+    socket_listen_port.erase(client_sock);
+    socket_listen_ip.erase(client_sock);
+    pthread_mutex_unlock(&socket_listen_port_mutex);
+
     close(client_sock);
 }
 
@@ -156,49 +154,49 @@ void handle_client(int client_sock, struct sockaddr_in client_addr) {
 void process_client_request(const string& command, int client_sock, 
                            string& client_user_id, const string& client_ip, int client_port) {
     // Debug: Print raw command received
-    std::cout << "DEBUG: Raw command received: '" << command << "' (length: " << command.length() << ")" << std::endl;
-    std::cout << "DEBUG: Hex dump: ";
+    cout << "DEBUG: Raw command received: '" << command << "' (length: " << command.length() << ")" << endl;
+    cout << "DEBUG: Hex dump: ";
     for (char c : command) {
-        std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)c << " ";
+        cout << hex << setw(2) << setfill('0') << (int)(unsigned char)c << " ";
     }
-    std::cout << std::dec << std::endl;
+    cout << dec << endl;
 
     // Debug: Print the raw command with length
-    std::cout << "DEBUG: Raw command before trim: '" << command << "' (length: " << command.length() << ")" << std::endl;
+    cout << "DEBUG: Raw command before trim: '" << command << "' (length: " << command.length() << ")" << endl;
     
     // Trim any leading/trailing whitespace including newlines
     auto cmd_trimmed = command;
     cmd_trimmed.erase(cmd_trimmed.find_last_not_of(" \t\n\r\f\v") + 1);
     cmd_trimmed.erase(0, cmd_trimmed.find_first_not_of(" \t\n\r\f\v"));
     
-    std::cout << "DEBUG: Command after trim: '" << cmd_trimmed << "' (length: " << cmd_trimmed.length() << ")" << std::endl;
+    cout << "DEBUG: Command after trim: '" << cmd_trimmed << "' (length: " << cmd_trimmed.length() << ")" << endl;
     
-    std::istringstream ss(cmd_trimmed);
-    std::vector<std::string> tokens;
-    std::string token;
+    istringstream ss(cmd_trimmed);
+    vector<string> tokens;
+    string token;
     
-    while (std::getline(ss, token, ' ')) {
+    while (getline(ss, token, ' ')) {
         // Trim each token to remove any remaining whitespace
         token.erase(token.find_last_not_of(" \t\n\r\f\v") + 1);
         token.erase(0, token.find_first_not_of(" \t\n\r\f\v"));
         
         if (!token.empty()) {
             tokens.push_back(token);
-            std::cout << "DEBUG: Token: ['" << token << "'] (length: " << token.length() << ")" << std::endl;
+            cout << "DEBUG: Token: ['" << token << "'] (length: " << token.length() << ")" << endl;
         }
     }
     
     // Debug: Print all tokens
-    std::cout << "DEBUG: Found " << tokens.size() << " tokens" << std::endl;
+    cout << "DEBUG: Found " << tokens.size() << " tokens" << endl;
     
     if (tokens.empty()) {
         const char* response = "Invalid command";
-        ::send(client_sock, response, std::strlen(response), 0);
+        ::send(client_sock, response, strlen(response), 0);
         return;
     }
     
     // Handle commands with spaces in them (e.g., "login user" -> "login_user")
-    std::string cmd = tokens[0];
+    string cmd = tokens[0];
     
     // First check if the command is already in the combined format (e.g., "list_groups")
     if (cmd == "list_groups" || cmd == "create_user" || cmd == "create_group" || 
@@ -208,7 +206,7 @@ void process_client_request(const string& command, int client_sock,
     }
     // Handle multi-word commands by checking the second token (e.g., "list groups" -> "list_groups")
     else if (tokens.size() > 1) {
-        std::string potential_cmd = tokens[0] + "_" + tokens[1];
+        string potential_cmd = tokens[0] + "_" + tokens[1];
         // Check if this is a known command with underscore
         if (potential_cmd == "create_user" || 
             potential_cmd == "create_group" ||
@@ -229,18 +227,36 @@ void process_client_request(const string& command, int client_sock,
     // Route to appropriate command handler
     if (cmd == "PORT" && tokens.size() == 2) {
         // Handle PORT command (from client connection)
-        int client_listen_port = std::stoi(tokens[1]);
-        std::cout << "Client connected with port: " << client_port 
-                  << " (listening on port: " << client_listen_port << ")" << std::endl;
+        // Support both formats: "PORT <port>" and "PORT <ip>:<port>"
+        string provided = tokens[1];
+        string provided_ip = client_ip; // default to remote IP
+        int client_listen_port = 0;
+        size_t colon_pos = provided.find(':');
+        if (colon_pos != string::npos) {
+            provided_ip = provided.substr(0, colon_pos);
+            client_listen_port = stoi(provided.substr(colon_pos + 1));
+        } else {
+            client_listen_port = stoi(provided);
+        }
+
+        cout << "Client connected with source port: " << client_port 
+                  << " (listening on: " << provided_ip << ":" << client_listen_port << ")" << endl;
         
         // Store the client's listening port
-        pthread_mutex_lock(&user_ip_port_mutex);
+    pthread_mutex_lock(&socket_listen_port_mutex);
+    // Store the listen port and provided ip for this socket
+    socket_listen_port[client_sock] = client_listen_port;
+    socket_listen_ip[client_sock] = provided_ip;
+    pthread_mutex_unlock(&socket_listen_port_mutex);
+
+        // If the client already logged in, also update the user_ip_port mapping immediately
         if (!client_user_id.empty()) {
-            user_ip_port[client_user_id] = std::make_pair(client_listen_port, client_ip);
+            pthread_mutex_lock(&user_ip_port_mutex);
+            user_ip_port[client_user_id] = make_pair(client_listen_port, provided_ip);
+            pthread_mutex_unlock(&user_ip_port_mutex);
         }
-        pthread_mutex_unlock(&user_ip_port_mutex);
         
-        std::string response = "PORT_ACK\n";
+        string response = "PORT_ACK\n";
         ::send(client_sock, response.c_str(), response.length(), 0);
         return;
     } else if (cmd == "create_user") {
@@ -269,12 +285,58 @@ void process_client_request(const string& command, int client_sock,
         list_files(tokens, client_sock, client_user_id);
     } else if (cmd == "stop_share") {
         stop_share(tokens, client_sock, client_user_id);
+    } else if (cmd == "I_HAVE") {
+        // Format: I_HAVE <group_id> <client_id> <file_hash> <file_path>
+        if (tokens.size() >= 5) {
+            string group_id = tokens[1];
+            string announcing_client = tokens[2];
+            string file_hash = tokens[3];
+            string file_path = tokens[4];
+
+            // Add client to user_files
+            pthread_mutex_lock(&user_files_mutex);
+            user_files[announcing_client].insert(file_hash);
+            pthread_mutex_unlock(&user_files_mutex);
+
+            // Add file to group_files if missing
+            pthread_mutex_lock(&group_files_mutex);
+            group_files[group_id].insert(file_hash);
+            pthread_mutex_unlock(&group_files_mutex);
+
+            // Add client to chunk_owners for all chunks (if we know total_chunks)
+            pthread_mutex_lock(&file_metadata_mutex);
+            auto it = file_metadata.find(file_hash);
+            if (it != file_metadata.end()) {
+                FileInfo &fi = it->second;
+                // If total_chunks is known, add the client to every chunk
+                int tc = fi.total_chunks > 0 ? fi.total_chunks : 1;
+                for (int i = 0; i < tc; ++i) fi.chunk_owners[i].insert(announcing_client);
+                // Optionally update file_path if missing
+                if (fi.file_path.empty()) fi.file_path = file_path;
+            } else {
+                // Create a minimal FileInfo if the file is unknown
+                FileInfo fi;
+                fi.file_hash = file_hash;
+                fi.file_path = file_path;
+                fi.file_name = file_path.substr(file_path.find_last_of("/\\") + 1);
+                fi.owner_id = announcing_client;
+                fi.file_size = 0;
+                fi.total_chunks = 1;
+                fi.chunk_owners[0].insert(announcing_client);
+                file_metadata[file_hash] = fi;
+            }
+            pthread_mutex_unlock(&file_metadata_mutex);
+
+            send_response(client_sock, "SUCCESS: Announced availability");
+        } else {
+            send_response(client_sock, "ERROR: Invalid I_HAVE format");
+        }
     } else if (cmd == "get_peers") {
         get_peers(tokens, client_sock, client_user_id);
     } else if (cmd == "update_file_metadata") {
         update_file_metadata(tokens, client_sock, client_user_id);
     } else {
-        std::string response = "Unknown command: " + cmd;
+        string response = "Unknown command: " + cmd;
         ::send(client_sock, response.c_str(), response.length(), 0);
     }
 }
@@ -478,7 +540,10 @@ void download_file(const vector<string>& tokens, int client_sock, const string& 
     peers.erase(unique(peers.begin(), peers.end()), peers.end());
 
     // Send response with file info, peers, and chunk hashes (if available)
-    string response = "FILE_INFO " + file_info.file_name + " " + 
+    // Format: FILE_INFO <file_path> <file_name> <file_hash> <file_size> <total_chunks> <num_peers> <peer1> ... [chunk_hashes...]
+    // Ensure we send a placeholder for file_hash if missing to keep token positions stable
+    string safe_file_hash = file_info.file_hash.empty() ? string("-") : file_info.file_hash;
+    string response = "FILE_INFO " + file_info.file_path + " " + file_info.file_name + " " + safe_file_hash + " " +
                      to_string(file_info.file_size) + " " + 
                      to_string(file_info.total_chunks) + " " + 
                      to_string(peers.size());
@@ -530,25 +595,26 @@ void list_files(const vector<string>& tokens, int client_sock, const string& cli
                     continue;
                 }
                 
-                // Add file info to the response
+                // Add file info to the response lines: name size total_chunks
                 if (!file_list.empty()) {
-                    file_list += " ";
+                    file_list += "\n";
                 }
-                file_list += file_info.file_name + ":" + file_hash + ":" + to_string(file_info.file_size);
+                file_list += file_info.file_name + " " + to_string(file_info.file_size) + " " + to_string(file_info.total_chunks);
                 file_count++;
                 
                 // Debug output
                 cout << "DEBUG: Listing file - "
                      << "Name: " << file_info.file_name
                      << ", Size: " << file_info.file_size
-                     << ", Hash: " << file_info.file_hash << endl;
+                     << ", Chunks: " << file_info.total_chunks << endl;
             }
         }
         
-        response = to_string(file_count) + " " + file_list;
+        // Response: first line is the count, followed by one file per line with: <name> <size> <total_chunks>
+        response = to_string(file_count) + "\n" + file_list;
         send_response(client_sock, response);
         
-    } catch (const std::exception& e) {
+    } catch (const exception& e) {
         cerr << "ERROR in list_files: " << e.what() << endl;
         send_response(client_sock, "ERROR: Internal server error");
     }
@@ -630,7 +696,7 @@ void update_file_metadata(const vector<string>& tokens, int client_sock, const s
         file_size = stoull(tokens[3]);
         total_chunks = stoi(tokens[4]);
         cout << "DEBUG: Parsed file_size: " << file_size << ", total_chunks: " << total_chunks << endl;
-    } catch (const std::exception& e) {
+    } catch (const exception& e) {
         string error = "ERROR: Invalid file size or chunk count: " + string(e.what());
         cout << error << endl;
         send_response(client_sock, error);
@@ -689,11 +755,11 @@ void update_file_metadata(const vector<string>& tokens, int client_sock, const s
         file_metadata[file_hash] = file_info;
         
         // Debug output
-        std::cout << "DEBUG: Updated file metadata - "
+        cout << "DEBUG: Updated file metadata - "
                   << "Name: " << file_info.file_name
                   << ", Size: " << file_info.file_size
                   << ", Hash: " << file_info.file_hash
-                  << ", Chunks: " << file_info.total_chunks << std::endl;
+                  << ", Chunks: " << file_info.total_chunks << endl;
         
         // Unlock file_metadata_mutex before locking others to prevent deadlocks
         pthread_mutex_unlock(&file_metadata_mutex);
@@ -721,7 +787,7 @@ void update_file_metadata(const vector<string>& tokens, int client_sock, const s
             }
             
             pthread_mutex_unlock(&user_files_mutex);
-        } catch (const std::exception& e) {
+        } catch (const exception& e) {
             pthread_mutex_unlock(&user_files_mutex);
             throw;
         }
@@ -743,7 +809,7 @@ void update_file_metadata(const vector<string>& tokens, int client_sock, const s
             }
             
             pthread_mutex_unlock(&group_files_mutex);
-        } catch (const std::exception& e) {
+        } catch (const exception& e) {
             pthread_mutex_unlock(&group_files_mutex);
             throw;
         }
@@ -754,7 +820,7 @@ void update_file_metadata(const vector<string>& tokens, int client_sock, const s
         
         // Send success response
         send_response(client_sock, "SUCCESS: File metadata updated successfully");
-    } catch (const std::exception& e) {
+    } catch (const exception& e) {
         // Ensure file_metadata_mutex is always unlocked
         pthread_mutex_unlock(&file_metadata_mutex);
         string error = "ERROR: " + string(e.what());
@@ -778,7 +844,7 @@ void update_file_info(const vector<string>& tokens, int client_sock, const strin
     try {
         file_size = stoull(tokens[2]);
         total_chunks = stoi(tokens[4]);
-    } catch (const std::exception& e) {
+    } catch (const exception& e) {
         send_response(client_sock, "ERROR: Invalid file size or chunk count");
         return;
     }
@@ -933,9 +999,23 @@ void login_user(const vector<string>& tokens, int client_sock,
         client_user_id = user_id;
         is_logged_in[user_id] = true;
         
-        // Store user's IP and port
+        // Store user's IP and listening port. Prefer the port and ip provided earlier via PORT command
+        int listen_port_to_store = client_port; // fallback to the source port
+        string ip_to_store = client_ip; // fallback to source IP
+
+        pthread_mutex_lock(&socket_listen_port_mutex);
+        auto spit = socket_listen_port.find(client_sock);
+        if (spit != socket_listen_port.end()) {
+            listen_port_to_store = spit->second;
+        }
+        auto sipit = socket_listen_ip.find(client_sock);
+        if (sipit != socket_listen_ip.end()) {
+            ip_to_store = sipit->second;
+        }
+        pthread_mutex_unlock(&socket_listen_port_mutex);
+
         pthread_mutex_lock(&user_ip_port_mutex);
-        user_ip_port[user_id] = make_pair(client_port, client_ip);
+        user_ip_port[user_id] = make_pair(listen_port_to_store, ip_to_store);
         pthread_mutex_unlock(&user_ip_port_mutex);
         
         response = "Login successful";
@@ -967,9 +1047,9 @@ void create_group(const vector<string>& tokens, int client_sock, const string& c
         group_admin[group_id] = client_user_id;
         
         // Get current time in milliseconds since epoch
-        auto now = std::chrono::system_clock::now();
+        auto now = chrono::system_clock::now();
         auto duration = now.time_since_epoch();
-        auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+        auto millis = chrono::duration_cast<chrono::milliseconds>(duration).count();
         
         // Add creator as first member
         pthread_mutex_lock(&group_members_mutex);
@@ -1015,12 +1095,6 @@ void list_groups(const vector<string>& tokens, int client_sock, const string& cl
 void logout(const vector<string>& tokens, int client_sock, string& client_user_id) {
     if (tokens.size() != 1) {
         string response = "Invalid command. Usage: logout";
-        ::send(client_sock, response.c_str(), response.length(), 0);
-        return;
-    }
-
-    if (client_user_id.empty()) {
-        string response = "Not logged in";
         ::send(client_sock, response.c_str(), response.length(), 0);
         return;
     }
@@ -1163,9 +1237,9 @@ void accept_request(const vector<string>& tokens, int client_sock, const string&
             // will be removed from the other tracker soon.
             
             // Get current time in milliseconds since epoch
-            auto now = std::chrono::system_clock::now();
+            auto now = chrono::system_clock::now();
             auto duration = now.time_since_epoch();
-            auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+            auto millis = chrono::duration_cast<chrono::milliseconds>(duration).count();
             
             // Add user to the group members
             pthread_mutex_lock(&group_members_mutex);

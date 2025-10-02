@@ -20,31 +20,123 @@
 #include <vector>
 #include <dirent.h>
 #include <filesystem>
+#include <queue>
+#include <functional>
+#include <condition_variable>
+#include <atomic>
+
+using namespace std;
 
 const size_t CHUNK_SIZE = 512 * 1024; // 512 KB fixed chunk size
-const int SOCKET_TIMEOUT_SEC = 10; // Socket timeout in seconds
 
 // Global control socket (if the interactive client registered one)
 static int g_control_socket = -1;
 
-// Set socket timeout
-static void set_socket_timeout(int sock, int seconds) {
-    struct timeval tv;
-    tv.tv_sec = seconds;
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-}
 
 // Constructor
-FileShareManager::FileShareManager(const std::string& client_id, 
-                                 const std::string& tracker_ip, 
+FileShareManager::FileShareManager(const string& client_id, 
+                                 const string& tracker_ip, 
                                  int tracker_port)
     : client_id(client_id), 
       tracker_ip(tracker_ip), 
       tracker_port(tracker_port) {
     // Create chunks directory if it doesn't exist
     mkdir("./chunks", 0777);
+}
+
+// Simple fixed-size thread pool for parallel chunk downloads
+class ThreadPool {
+public:
+    ThreadPool(size_t n) : stop(false) {
+        for (size_t i = 0; i < n; ++i) {
+            workers.emplace_back([this]() {
+                while (true) {
+                    function<void()> task;
+                    {
+                        unique_lock<mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock, [this]{ return this->stop || !this->tasks.empty(); });
+                        if (this->stop && this->tasks.empty()) return;
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+                    try { task(); } catch (...) { }
+                }
+            });
+        }
+    }
+
+    ~ThreadPool() {
+        {
+            unique_lock<mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (auto &t : workers) if (t.joinable()) t.join();
+    }
+
+    void submit(function<void()> f) {
+        {
+            lock_guard<mutex> lock(queue_mutex);
+            tasks.push(std::move(f));
+        }
+        condition.notify_one();
+    }
+
+    // wait until queue is empty
+    void wait_empty() {
+        while (true) {
+            {
+                lock_guard<mutex> lock(queue_mutex);
+                if (tasks.empty()) break;
+            }
+            this_thread::sleep_for(chrono::milliseconds(50));
+        }
+    }
+
+private:
+    vector<thread> workers;
+    queue<function<void()>> tasks;
+    mutex queue_mutex;
+    condition_variable condition;
+    bool stop;
+};
+
+void FileShareManager::set_client_id(const string& id) {
+    this->client_id = id;
+}
+
+bool FileShareManager::announce_share(const string& group_id, const string& file_hash, const string& file_path) const {
+    // Send a simple I_HAVE command to tracker: I_HAVE <group_id> <client_id> <file_hash> <file_path>
+    if (client_id.empty()) return false;
+
+    bool owned = true;
+    int sock = connect_to_tracker(owned);
+    if (sock < 0) return false;
+
+    string message = "I_HAVE " + group_id + " " + client_id + " " + file_hash + " " + file_path + "\n";
+    ssize_t total = 0;
+    const char* buf = message.c_str();
+    ssize_t len = (ssize_t)message.length();
+    while (total < len) {
+        ssize_t sent = send(sock, buf + total, len - total, MSG_NOSIGNAL);
+        if (sent <= 0) {
+            if (errno == EINTR) continue;
+            if (owned) close(sock);
+            return false;
+        }
+        total += sent;
+    }
+
+    // Read a short acknowledgement line (optional)
+    char rbuf[1024];
+    ssize_t n = recv(sock, rbuf, sizeof(rbuf)-1, 0);
+    if (n > 0) {
+        rbuf[n] = '\0';
+        // ignore content here
+    }
+
+    if (owned) close(sock);
+    return true;
 }
 
 void FileShareManager::set_control_socket(int sock) {
@@ -61,7 +153,7 @@ int FileShareManager::connect_to_tracker(bool &out_owned) const {
     }
     out_owned = true;
     // Use the helper in network_utils to open a new connection
-    extern int connect_to_tracker(const std::string&, int, const std::string&);
+    extern int connect_to_tracker(const string&, int, const string&);
     return connect_to_tracker(tracker_ip, tracker_port, "");
 }
 
@@ -69,15 +161,14 @@ int FileShareManager::connect_to_tracker(bool &out_owned) const {
 FileShareManager::~FileShareManager() {
     // Clean up any active downloads
     {
-        std::lock_guard<std::mutex> lock(downloads_mutex);
-        for (const auto& [id, info] : active_downloads) {
-            // Notify any waiting threads
+        lock_guard<mutex> lock(downloads_mutex);
+        if (!active_downloads.empty()) {
             cv_downloads.notify_all();
         }
     }
     
     // Wait for all downloads to complete or timeout
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    this_thread::sleep_for(chrono::seconds(1));
 }
 
 // Helper function to create a TCP socket and connect to the tracker
@@ -142,14 +233,14 @@ int FileShareManager::connect_to_tracker() const {
 }
 
 // Helper function to send a message to the tracker
-bool FileShareManager::send_to_tracker(const std::string& message) const {
+bool FileShareManager::send_to_tracker(const string& message) const {
     int sock = connect_to_tracker();
     if (sock < 0) {
         return false;
     }
 
     // Send a newline-terminated message and close
-    std::string tosend = message;
+    string tosend = message;
     if (tosend.empty() || tosend.back() != '\n') tosend.push_back('\n');
 
     ssize_t total = 0;
@@ -171,34 +262,34 @@ bool FileShareManager::send_to_tracker(const std::string& message) const {
 }
 
 // Register a file share with the tracker
-bool FileShareManager::register_share_with_tracker(const std::string& group_id, 
-                                                 const std::string& file_name) {
-    std::string message = "SHARE " + group_id + " " + client_id + " " + file_name;
+bool FileShareManager::register_share_with_tracker(const string& group_id, 
+                                                 const string& file_name) {
+    string message = "SHARE " + group_id + " " + client_id + " " + file_name;
     return send_to_tracker(message);
 }
 
 // Unregister a file share with the tracker
-bool FileShareManager::unregister_share_with_tracker(const std::string& group_id, 
-                                                   const std::string& file_name) {
-    std::string message = "STOP_SHARE " + group_id + " " + client_id + " " + file_name;
+bool FileShareManager::unregister_share_with_tracker(const string& group_id, 
+                                                   const string& file_name) {
+    string message = "STOP_SHARE " + group_id + " " + client_id + " " + file_name;
     return send_to_tracker(message);
 }
 
 // Upload a file to share
-bool FileShareManager::upload_file(const std::string& group_id, 
-                                 const std::string& file_path,
+bool FileShareManager::upload_file(const string& group_id, 
+                                 const string& file_path,
                                  ProgressCallback callback) {
     // Step 1: Split file into chunks and calculate hashes
     FileMetadata metadata;
     try {
-    std::cout << "Splitting file into chunks..." << std::endl;
+    cout << "Splitting file into chunks..." << endl;
     metadata = split_file_into_chunks(file_path);
-    std::cout << "Calculating file hash..." << std::endl;
+    cout << "Calculating file hash..." << endl;
     metadata.file_hash = calculate_file_hash(file_path);
         
         // Store metadata locally
         {
-            std::lock_guard<std::mutex> lock(shared_files_mutex);
+            lock_guard<mutex> lock(shared_files_mutex);
             file_metadata[metadata.file_name] = metadata;
             shared_files[group_id].insert(metadata.file_name);
         }
@@ -207,95 +298,97 @@ bool FileShareManager::upload_file(const std::string& group_id,
         bool sock_owned = true;
         int sock = connect_to_tracker(sock_owned);
         if (sock < 0) {
-            throw std::runtime_error("Failed to connect to tracker");
+            throw runtime_error("Failed to connect to tracker");
         }
         // Send the upload command to the tracker (newline-terminated)
-        std::string command = "upload_file " + group_id + " " + file_path + "\n";
+        string command = "upload_file " + group_id + " " + file_path + "\n";
         if (send(sock, command.c_str(), command.length(), MSG_NOSIGNAL) <= 0) {
             close(sock);
-            throw std::runtime_error("Failed to send upload command to tracker");
+            throw runtime_error("Failed to send upload command to tracker");
         }
 
         // Read one line of response
-        auto recv_line = [&](int s)->std::string {
-            std::string buf;
+        auto recv_line = [&](int s)->string {
+            string buf;
             char rbuf[4096];
             while (true) {
                 ssize_t n = recv(s, rbuf, sizeof(rbuf), 0);
                 if (n <= 0) break;
                 buf.append(rbuf, n);
                 size_t pos = buf.find('\n');
-                if (pos != std::string::npos) {
-                    std::string line = buf.substr(0, pos);
+                if (pos != string::npos) {
+                    string line = buf.substr(0, pos);
                     return line;
                 }
                 if (buf.size() > 10 * 1024) break; // too long
             }
-            return std::string();
+            return string();
         };
 
-        std::string response = recv_line(sock);
+        string response = recv_line(sock);
         if (response.empty()) {
             close(sock);
-            throw std::runtime_error("No response or invalid response from tracker");
+            throw runtime_error("No response or invalid response from tracker");
         }
 
-        std::vector<std::string> tokens;
-        std::istringstream iss(response);
-        std::string token;
+        vector<string> tokens;
+        istringstream iss(response);
+        string token;
         while (iss >> token) tokens.push_back(token);
         if (tokens.empty() || tokens[0] != "PROCESS_FILE") {
             close(sock);
-            throw std::runtime_error("Unexpected response from tracker: " + response);
+            throw runtime_error("Unexpected response from tracker: " + response);
         }
         
         // Display upload information
-        std::cout << "\n=== File Upload Started ===" << std::endl;
-        std::cout << "File: " << metadata.file_name << std::endl;
-        std::cout << "Size: " << metadata.file_size << " bytes" << std::endl;
-        std::cout << "Hash: " << metadata.file_hash << std::endl;
-        std::cout << "Chunks: " << metadata.total_chunks << std::endl;
-        std::cout << "Group: " << group_id << std::endl;
+        cout << "\n=== File Upload Started ===" << endl;
+        cout << "File: " << metadata.file_name << endl;
+        cout << "Size: " << metadata.file_size << " bytes" << endl;
+        cout << "Hash: " << metadata.file_hash << endl;
+        cout << "Chunks: " << metadata.total_chunks << endl;
+        cout << "Group: " << group_id << endl;
         
         // Send the file metadata to the tracker
         // Build update command and include per-chunk hashes so tracker can verify later
         command = "update_file_metadata " + tokens[1] + " " +
                  metadata.file_hash + " " +
-                 std::to_string(metadata.file_size) + " " +
-                 std::to_string(metadata.total_chunks);
+                 to_string(metadata.file_size) + " " +
+                 to_string(metadata.total_chunks);
 
         // Append each chunk's hash
         for (const auto& c : metadata.chunks) {
             command += " " + c.hash;
         }
 
-        std::cout << "DEBUG: Sending update_file_metadata command: " << command << std::endl;
+        cout << "DEBUG: Sending update_file_metadata command: " << command << endl;
         if (send(sock, (command + "\n").c_str(), command.length() + 1, MSG_NOSIGNAL) <= 0) {
             close(sock);
-            throw std::runtime_error("Failed to send file metadata");
+            throw runtime_error("Failed to send file metadata");
         }
 
         response = recv_line(sock);
-        std::cout << "DEBUG: Received response to update_file_metadata: " << response << std::endl;
+        cout << "DEBUG: Received response to update_file_metadata: " << response << endl;
     if (sock_owned) close(sock);
         
-    if (response.find("SUCCESS") == 0) {
+        if (response.find("SUCCESS") == 0) {
             // Convert file size to KB with 2 decimal places
             double file_size_kb = static_cast<double>(metadata.file_size) / 1024.0;
-            std::cout << "\nFile Upload Complete. " 
-                      << metadata.file_name << " " 
-                      << std::fixed << std::setprecision(2) << file_size_kb 
-                      << " KB" << std::endl;
+            cout << "\nFile Upload Complete. " 
+                 << metadata.file_name << " " 
+                 << fixed << setprecision(2) << file_size_kb 
+                 << " KB";
+            // Also show number of chunks uploaded (requested UX change)
+            cout << " (chunks: " << metadata.total_chunks << ")" << endl;
             return true;
         } else {
-            throw std::runtime_error("Failed to complete file upload: " + response);
+            throw runtime_error("Failed to complete file upload: " + response);
         }
         
-    } catch (const std::exception& e) {
+    } catch (const exception& e) {
         // Cleanup on failure
-        std::cerr << "Upload failed: " << e.what() << std::endl;
+        cerr << "Upload failed: " << e.what() << endl;
         if (!metadata.file_name.empty()) {
-            std::lock_guard<std::mutex> lock(shared_files_mutex);
+            lock_guard<mutex> lock(shared_files_mutex);
             shared_files[group_id].erase(metadata.file_name);
             file_metadata.erase(metadata.file_name);
         }
@@ -304,319 +397,311 @@ bool FileShareManager::upload_file(const std::string& group_id,
 }
 
 // List files in a group from tracker
-std::vector<std::string> FileShareManager::list_files(const std::string& group_id) const {
-    std::vector<std::string> files;
+vector<string> FileShareManager::list_files(const string& group_id) const {
+    vector<string> files;
     
     try {
         // Connect to tracker
         int sock = connect_to_tracker();
         if (sock < 0) {
-            std::cerr << "Failed to connect to tracker" << std::endl;
+            cerr << "Failed to connect to tracker" << endl;
             return {};
         }
 
-        std::string command = "list_files " + group_id + "\n";
+        string command = "list_files " + group_id + "\n";
         if (send(sock, command.c_str(), command.length(), MSG_NOSIGNAL) <= 0) {
             close(sock);
             return {};
         }
 
-        // Read one line response
-        std::string buf;
+        // Read full response until the server closes the connection
+        string buf;
         char rbuf[4096];
         while (true) {
             ssize_t n = recv(sock, rbuf, sizeof(rbuf), 0);
-            if (n <= 0) break;
+            if (n <= 0) break; // either closed or error
             buf.append(rbuf, n);
-            size_t pos = buf.find('\n');
-            if (pos != std::string::npos) {
-                std::string line = buf.substr(0, pos);
-                // parse line: count <files...> or directly files
-                std::istringstream iss(line);
-                std::string token;
-                while (std::getline(iss, token, ' ')) {
-                    if (!token.empty()) files.push_back(token);
-                }
-                break;
-            }
-            if (buf.size() > 16 * 1024) break;
+            // guard against extremely large responses
+            if (buf.size() > 1 * 1024 * 1024) break;
         }
         close(sock);
-    } catch (const std::exception& e) {
-        std::cerr << "Error listing files: " << e.what() << std::endl;
+
+        if (buf.empty()) return {};
+
+        // Split into lines
+        istringstream resp(buf);
+        string line;
+        // First line expected to be a count (optional). We'll try to read it and then
+        // treat each subsequent non-empty line as a file entry in the format:
+        // <file_name> <file_size> <total_chunks>
+        if (!getline(resp, line)) return {};
+        // Try to parse count, but if it's not a number we will treat the first line
+        // as a file entry as well.
+        try {
+            (void)stoi(line); // parse count but we don't strictly need it
+        } catch (...) {
+            // treat the first line as a file entry
+            if (!line.empty()) files.push_back(line);
+        }
+
+        // Read remaining lines
+        while (getline(resp, line)) {
+            if (line.empty()) continue;
+            files.push_back(line);
+        }
+    } catch (const exception& e) {
+        cerr << "Error listing files: " << e.what() << endl;
     }
     
     return files;
 }
 
 // Download a file from the network
-bool FileShareManager::download_file(const std::string& group_id, 
-                                   const std::string& file_name, 
-                                   const std::string& dest_path) {
+bool FileShareManager::download_file(const string& group_id, 
+                                   const string& file_name, 
+                                   const string& dest_path) {
     try {
         // Step 1: Get file info from tracker (reuse control socket if registered)
         bool sock_owned = true;
         int sock = connect_to_tracker(sock_owned);
         if (sock < 0) {
-            throw std::runtime_error("Failed to connect to tracker");
+            throw runtime_error("Failed to connect to tracker");
         }
 
         // Use tracker download_file to get FILE_INFO and peers
-        std::string command = "download_file " + group_id + " " + file_name + "\n";
+        string command = "download_file " + group_id + " " + file_name + "\n";
         if (send(sock, command.c_str(), command.length(), MSG_NOSIGNAL) <= 0) {
             if (sock_owned) close(sock);
-            throw std::runtime_error("Failed to request file info");
+            throw runtime_error("Failed to request file info");
         }
 
         // Read one line of response
-        std::string buf;
+        string buf;
         char rbuf[8192];
         ssize_t n = recv(sock, rbuf, sizeof(rbuf), 0);
         if (n <= 0) {
             if (sock_owned) close(sock);
-            throw std::runtime_error("No response from tracker");
+            throw runtime_error("No response from tracker");
         }
         buf.append(rbuf, n);
         // Stop at newline
         size_t pos = buf.find('\n');
-        std::string line = (pos == std::string::npos) ? buf : buf.substr(0, pos);
+        string line = (pos == string::npos) ? buf : buf.substr(0, pos);
         if (sock_owned) close(sock);
 
-        // Expected format: FILE_INFO <file_name> <file_size> <total_chunks> <num_peers> <peer1> <peer2> ...
-        std::istringstream iss(line);
-        std::string header;
+        // Expected format (new): FILE_INFO <file_path> <file_name> <file_size> <total_chunks> <num_peers> <peer1> ... [chunk_hashes...]
+        istringstream iss(line);
+        string header;
         iss >> header;
         if (header != "FILE_INFO") {
-            throw std::runtime_error("Invalid FILE_INFO from tracker: " + line);
+            throw runtime_error("Invalid FILE_INFO from tracker: " + line);
         }
-        uint64_t file_size;
-        std::string file_hash_or_name;
-        int total_chunks;
-        int num_peers;
-        iss >> file_hash_or_name >> file_size >> total_chunks >> num_peers;
-        std::vector<std::string> peers;
+    string file_path_recv;
+    string file_name_recv;
+    string file_hash_recv;
+    uint64_t file_size;
+    int total_chunks;
+    int num_peers;
+    iss >> file_path_recv >> file_name_recv >> file_hash_recv >> file_size >> total_chunks >> num_peers;
+        vector<string> peers;
         for (int i = 0; i < num_peers; ++i) {
-            std::string p; if (!(iss >> p)) break; peers.push_back(p);
+            string p; if (!(iss >> p)) break; peers.push_back(p);
         }
         
         // Step 2: Create download directory if it doesn't exist
-        std::filesystem::path dest_dir = std::filesystem::path(dest_path).parent_path();
-        if (!dest_dir.empty() && !std::filesystem::exists(dest_dir)) {
-            std::filesystem::create_directories(dest_dir);
+        filesystem::path dest_dir = filesystem::path(dest_path).parent_path();
+        if (!dest_dir.empty() && !filesystem::exists(dest_dir)) {
+            filesystem::create_directories(dest_dir);
         }
         
         // Step 3: Prepare download info
-        std::string download_id = group_id + ":" + file_name + ":" + std::to_string(std::time(nullptr));
+        string download_id = group_id + ":" + file_name + ":" + to_string(time(nullptr));
         
         DownloadInfo info;
         info.file_name = file_name;
         info.dest_path = dest_path;
+    info.group_id = group_id;
         info.total_chunks = total_chunks;
         info.downloaded_chunks = 0;
-        info.start_time = std::chrono::system_clock::now();
+        info.start_time = chrono::system_clock::now();
         
         // Add to active downloads
         {
-            std::lock_guard<std::mutex> lock(downloads_mutex);
+            lock_guard<mutex> lock(downloads_mutex);
             active_downloads[download_id] = info;
         }
         
-        // Step 4: Get list of peers with the file
-        // Reuse control socket if we have one registered
-        bool sock2_owned = true;
-        int sock2 = connect_to_tracker(sock2_owned);
-        if (sock2 < 0) {
-            throw std::runtime_error("Failed to connect to tracker for peer list");
-        }
-
-        command = "get_peers " + group_id + " " + file_hash_or_name + "\n";
-        if (send(sock2, command.c_str(), command.length(), MSG_NOSIGNAL) <= 0) {
-            if (sock2_owned) close(sock2);
-            throw std::runtime_error("Failed to request peer list");
-        }
-
-        // Read response lines until newline
-        std::string response;
-        char rbuf2[8192];
-        while (true) {
-            ssize_t rn = recv(sock2, rbuf2, sizeof(rbuf2), 0);
-            if (rn <= 0) break;
-            response.append(rbuf2, rn);
-            size_t p = response.find('\n');
-            if (p != std::string::npos) {
-                response = response.substr(0, p);
-                break;
-            }
-            if (response.size() > 64 * 1024) break;
-        }
-    if (sock2_owned) close(sock2);
-        
-        // Parse peer list
-        std::istringstream peer_stream(response);
-        std::string peer_addr;
-        while (std::getline(peer_stream, peer_addr)) {
-            if (!peer_addr.empty()) {
-                peers.push_back(peer_addr);
-            }
-        }
+        // Peers were provided in FILE_INFO; no extra get_peers call required
         
         if (peers.empty()) {
-            throw std::runtime_error("No peers available for this file");
+            throw runtime_error("No peers available for this file");
         }
         
     // Step 5: Parse optional chunk hashes appended after peers
-        std::vector<std::string> chunk_hashes;
+        vector<string> chunk_hashes;
         // Any remaining tokens in 'line' after peers are chunk hashes
         // We already parsed peers from the first FILE_INFO line; try to extract hashes from that line too
         {
             // Re-parse the FILE_INFO line to extract everything after peers
-            std::istringstream iss2(line);
-            std::string tok;
-            std::vector<std::string> all_tokens;
-            while (iss2 >> tok) all_tokens.push_back(tok);
-            // FILE_INFO name size total_chunks num_peers peer1 ... peerN [hash1 ...]
-            int header_count = 5 + num_peers; // FILE_INFO + name + size + total_chunks + num_peers + peers
-            if ((int)all_tokens.size() > header_count) {
-                for (int i = header_count; i < (int)all_tokens.size(); ++i) {
-                    chunk_hashes.push_back(all_tokens[i]);
+            {
+                istringstream iss2(line);
+                string tok;
+                vector<string> all_tokens;
+                while (iss2 >> tok) all_tokens.push_back(tok);
+                // Token layout (indices):
+                // [0]=FILE_INFO [1]=file_path [2]=file_name [3]=file_hash [4]=file_size [5]=total_chunks [6]=num_peers [7..6+num_peers]=peers [after]=chunk_hashes
+                int header_count = 7 + num_peers; // up to and including peers
+                if ((int)all_tokens.size() > header_count) {
+                    for (int i = header_count; i < (int)all_tokens.size(); ++i) {
+                        // Treat placeholder '-' as missing
+                        if (all_tokens[i] == "-") continue;
+                        chunk_hashes.push_back(all_tokens[i]);
+                    }
                 }
             }
         }
 
         // Debug: print parsed info
-        std::cout << "DEBUG: Parsed FILE_INFO - file='" << file_name << "' size=" << file_size
-                  << " total_chunks=" << total_chunks << " num_peers=" << num_peers << std::endl;
-        std::cout << "DEBUG: Peers list (" << peers.size() << "):";
-        for (const auto &p : peers) std::cout << " '" << p << "'";
-        std::cout << std::endl;
+    cout << "DEBUG: Parsed FILE_INFO - file='" << file_name_recv << "' size=" << file_size
+                  << " total_chunks=" << total_chunks << " num_peers=" << num_peers << endl;
+        cout << "DEBUG: Peers list (" << peers.size() << "):";
+        for (const auto &p : peers) cout << " '" << p << "'";
+        cout << endl;
         if (!chunk_hashes.empty()) {
-            std::cout << "DEBUG: Received " << chunk_hashes.size() << " chunk hashes" << std::endl;
+            cout << "DEBUG: Received " << chunk_hashes.size() << " chunk hashes" << endl;
         } else {
-            std::cout << "DEBUG: No per-chunk hashes provided by tracker" << std::endl;
+            cout << "DEBUG: No per-chunk hashes provided by tracker" << endl;
         }
 
         // Prepare temp dir for chunks
-        std::filesystem::path temp_dir = std::filesystem::path("./chunks") / (file_name + "_chunks_tmp_") / std::to_string(std::time(nullptr));
-        std::filesystem::create_directories(temp_dir);
+        filesystem::path temp_dir = filesystem::path("./chunks") / (file_name_recv + "_chunks_tmp_") / to_string(time(nullptr));
+        filesystem::create_directories(temp_dir);
 
-        // Helper to download a single chunk from a peer
-        auto download_chunk_from_peer = [&](const std::string& peer, int chunkno, const std::string& expected_hash)->bool {
-            // peer format ip:port
-            size_t colon = peer.find(':');
-            if (colon == std::string::npos) return false;
-            std::string ip = peer.substr(0, colon);
-            int port = stoi(peer.substr(colon + 1));
-            std::cout << "DEBUG: Attempting connection to peer " << ip << ":" << port << " for chunk " << chunkno << std::endl;
-            int psock = connect_to_server(ip, port);
-            if (psock < 0) {
-                std::cout << "DEBUG: connect_to_server failed for " << ip << ":" << port << std::endl;
-                return false;
-            }
+        // Thread pool sizing: use hardware concurrency but cap to 16 threads
+        unsigned int hw = thread::hardware_concurrency();
+        if (hw == 0) hw = 2;
+        unsigned int pool_size = min<unsigned int>((unsigned int)total_chunks, min<unsigned int>(hw, 16));
+        ThreadPool pool(pool_size);
 
-            // Request one chunk at a time: filepath$chunkno$1
-            std::string request = file_name + "$" + std::to_string(chunkno) + "$1";
-            std::cout << "DEBUG: Sending peer request: '" << request << "'" << std::endl;
-            if (send(psock, request.c_str(), request.length(), 0) <= 0) {
-                std::cout << "DEBUG: Failed to send request to peer " << ip << ":" << port << std::endl;
-                close(psock);
-                return false;
-            }
+        atomic<int> failed_chunks{0};
+        atomic<int> completed_chunks{0};
+        atomic<bool> cancel_flag{false};
 
-            std::string chunk_path = (temp_dir / ("chunk_" + std::to_string(chunkno))).string();
-            std::ofstream out(chunk_path, std::ios::binary);
-            if (!out) {
-                std::cout << "DEBUG: Failed to open chunk file for writing: " << chunk_path << std::endl;
-                close(psock);
-                return false;
-            }
-
-            char buffer[CHUNK_SIZE];
-            ssize_t received;
-            ssize_t total_received = 0;
-            // Read until peer closes or until we see no more data
-            while ((received = recv(psock, buffer, sizeof(buffer), 0)) > 0) {
-                out.write(buffer, received);
-                total_received += received;
-            }
-            out.close();
-            if (received == 0) {
-                // peer closed connection normally
-            } else if (received < 0) {
-                std::cout << "DEBUG: recv() error while downloading chunk " << chunkno << ": " << strerror(errno) << std::endl;
-            }
-            close(psock);
-
-            std::cout << "DEBUG: Received " << total_received << " bytes for chunk " << chunkno << " from " << ip << ":" << port << std::endl;
-
-            // Verify chunk if expected hash provided
-            if (!expected_hash.empty()) {
-                bool ok = verify_chunk(chunk_path, expected_hash);
-                std::cout << "DEBUG: Chunk " << chunkno << " verification result: " << (ok ? "OK" : "FAIL") << std::endl;
-                if (!ok) {
-                    // remove bad file
-                    std::error_code ec;
-                    std::filesystem::remove(chunk_path, ec);
-                    if (ec) std::cout << "DEBUG: Failed to remove bad chunk file: " << ec.message() << std::endl;
-                    return false;
-                }
-            }
-            return total_received > 0;
-        };
-
-        // Download each chunk by trying peers in round-robin until success
+        // For each chunk, submit a download task
         for (int chunkno = 0; chunkno < total_chunks; ++chunkno) {
-            bool chunk_ok = false;
-            std::string expected_hash = (chunkno < (int)chunk_hashes.size()) ? chunk_hashes[chunkno] : std::string();
+            string expected_hash = (chunkno < (int)chunk_hashes.size()) ? chunk_hashes[chunkno] : string();
 
-            for (const auto& peer : peers) {
-                if (download_chunk_from_peer(peer, chunkno, expected_hash)) {
+            // capture file_path_recv and file_name_recv by value for use inside lambda
+            pool.submit([this, &peers, chunkno, expected_hash, &temp_dir, &completed_chunks, &failed_chunks, &cancel_flag, &download_id, file_path_recv, file_name_recv]() {
+                if (cancel_flag.load()) return;
+
+                bool chunk_ok = false;
+                // Try peers in order
+                for (const auto& peer : peers) {
+                    if (cancel_flag.load()) break;
+                    // peer format ip:port
+                    size_t colon = peer.find(':');
+                    if (colon == string::npos) continue;
+                    string ip = peer.substr(0, colon);
+                    int port = stoi(peer.substr(colon + 1));
+                    int psock = connect_to_server(ip, port);
+                    if (psock < 0) continue;
+
+                    // Request one chunk at a time: <file_path>$chunkno$1  (use file_path received from tracker if present)
+                    string request_file = !file_path_recv.empty() ? file_path_recv : file_name_recv;
+                    string request = request_file + "$" + to_string(chunkno) + "$1";
+                    if (send(psock, request.c_str(), request.length(), 0) <= 0) {
+                        close(psock);
+                        continue;
+                    }
+
+                    string chunk_path = (temp_dir / ("chunk_" + to_string(chunkno))).string();
+                    ofstream out(chunk_path, ios::binary);
+                    if (!out) { close(psock); continue; }
+
+                    vector<char> buffer(CHUNK_SIZE);
+                    ssize_t received;
+                    ssize_t total_received = 0;
+                    while ((received = recv(psock, buffer.data(), buffer.size(), 0)) > 0) {
+                        out.write(buffer.data(), received);
+                        total_received += received;
+                    }
+                    out.close();
+                    close(psock);
+
+                    if (total_received <= 0) {
+                        // nothing received
+                        error_code ec;
+                        filesystem::remove(chunk_path, ec);
+                        continue;
+                    }
+
+                    string expected = expected_hash;
+                    if (expected == "-") expected.clear();
+                    if (!expected.empty()) {
+                        bool ok = verify_chunk(chunk_path, expected);
+                        if (!ok) {
+                            error_code ec; filesystem::remove(chunk_path, ec);
+                            continue;
+                        }
+                    }
+
+                    // success
                     chunk_ok = true;
                     break;
                 }
-            }
 
-            if (!chunk_ok) {
-                throw std::runtime_error("Failed to download chunk " + std::to_string(chunkno));
-            }
-
-            // Update progress
-            {
-                std::lock_guard<std::mutex> lock(downloads_mutex);
-                auto it = active_downloads.find(download_id);
-                if (it != active_downloads.end()) {
-                    it->second.downloaded_chunks++;
+                if (!chunk_ok) {
+                    failed_chunks++;
+                    cancel_flag.store(true);
+                } else {
+                    completed_chunks++;
+                    // update shared progress info
+                    lock_guard<mutex> lock(downloads_mutex);
+                    auto it = active_downloads.find(download_id);
+                    if (it != active_downloads.end()) it->second.downloaded_chunks++;
                 }
-            }
+            });
+        }
+
+        // Wait for all tasks to finish
+        pool.wait_empty();
+
+        // After queue drained, destruct pool to join workers
+
+        if (failed_chunks.load() > 0) {
+            throw runtime_error("Failed to download one or more chunks");
         }
 
         // Combine chunks
-        std::string final_temp_dir = temp_dir.string();
+        string final_temp_dir = temp_dir.string();
         if (!combine_chunks(dest_path, final_temp_dir, total_chunks)) {
-            throw std::runtime_error("Failed to combine chunks");
+            throw runtime_error("Failed to combine chunks");
         }
 
-        // Verify final file hash if provided (some trackers may send file hash in other responses)
-        if (!file_hash_or_name.empty()) {
-            try {
-                if (!verify_file_integrity(dest_path, file_hash_or_name)) {
-                    throw std::runtime_error("Final file hash mismatch");
-                }
-            } catch (...) {
-                throw;
+        // Verify final file hash if provided by FILE_INFO
+        if (!file_hash_recv.empty()) {
+            if (!verify_file_integrity(dest_path, file_hash_recv)) {
+                throw runtime_error("Final file hash mismatch");
             }
         }
 
         // Cleanup active download entry
         {
-            std::lock_guard<std::mutex> lock(downloads_mutex);
-            active_downloads.erase(download_id);
+            lock_guard<mutex> lock(downloads_mutex);
+            // Move to completed downloads for history
+            auto it = active_downloads.find(download_id);
+            if (it != active_downloads.end()) {
+                completed_downloads[download_id] = it->second;
+                active_downloads.erase(it);
+            }
         }
 
-        std::cout << "Download complete: " << dest_path << std::endl;
+        cout << "Download complete: " << dest_path << endl;
         return true;
         
-    } catch (const std::exception& e) {
-        std::cerr << "Download failed: " << e.what() << std::endl;
+    } catch (const exception& e) {
+        cerr << "Download failed: " << e.what() << endl;
         return false;
     }
     // 4. Verifying chunk hashes
@@ -636,7 +721,7 @@ bool FileShareManager::send_with_retry(int sock, const void* buf, size_t len, in
         if (sent <= 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 retries++;
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                this_thread::sleep_for(chrono::milliseconds(100));
                 continue;
             }
             return false;
@@ -662,7 +747,7 @@ bool FileShareManager::recv_with_retry(int sock, void* buf, size_t len, int flag
             }
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 retries++;
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                this_thread::sleep_for(chrono::milliseconds(100));
                 continue;
             }
             return false;
@@ -674,7 +759,7 @@ bool FileShareManager::recv_with_retry(int sock, void* buf, size_t len, int flag
 }
 
 // Message protocol: [4-byte length][message]
-bool FileShareManager::send_message(int sock, const std::string& message) const {
+bool FileShareManager::send_message(int sock, const string& message) const {
     // Send message length (network byte order)
     uint32_t len = htonl(message.length());
     if (!send_with_retry(sock, &len, sizeof(len))) {
@@ -685,7 +770,7 @@ bool FileShareManager::send_message(int sock, const std::string& message) const 
     return send_with_retry(sock, message.data(), message.length());
 }
 
-std::string FileShareManager::receive_message(int sock) const {
+string FileShareManager::receive_message(int sock) const {
     // Receive message length
     uint32_t len_net;
     if (!recv_with_retry(sock, &len_net, sizeof(len_net))) {
@@ -699,7 +784,7 @@ std::string FileShareManager::receive_message(int sock) const {
     }
     
     // Receive message data
-    std::string message(len, '\0');
+    string message(len, '\0');
     if (!recv_with_retry(sock, &message[0], len)) {
         return "";
     }
@@ -709,41 +794,22 @@ std::string FileShareManager::receive_message(int sock) const {
 
 // Show current downloads
 void FileShareManager::show_downloads() const {
-    std::lock_guard<std::mutex> lock(downloads_mutex);
-    
-    if (active_downloads.empty()) {
-        std::cout << "No active downloads" << std::endl;
-        return;
-    }
-    
-    auto now = std::chrono::system_clock::now();
-    
-    std::cout << "\nActive Downloads:";
-    std::cout << "\n--------------------------------------------------" << std::endl;
-    
+    lock_guard<mutex> lock(downloads_mutex);
+    // Print currently downloading entries with [D]
     for (const auto& [id, info] : active_downloads) {
-        auto duration = std::chrono::duration_cast<std::chrono::seconds>(
-            now - info.start_time).count();
-            
-        double speed = (info.downloaded_chunks * CHUNK_SIZE) / 
-                      (duration > 0 ? duration : 1) / 1024.0; // KB/s
-        
-        double progress = (info.downloaded_chunks * 100.0) / info.total_chunks;
-        
-        std::cout << "File: " << info.file_name << "\n"
-                  << "  Progress: " << std::fixed << std::setprecision(1) << progress 
-                  << "% (" << info.downloaded_chunks << "/" << info.total_chunks << " chunks)\n"
-                  << "  Speed: " << std::fixed << std::setprecision(1) << speed << " KB/s\n"
-                  << "  Time: " << duration << "s\n"
-                  << "  Destination: " << info.dest_path << "\n"
-                  << std::endl;
+        double progress = (info.total_chunks > 0) ? ((info.downloaded_chunks * 100.0) / info.total_chunks) : 0.0;
+        cout << "[D] [" << info.group_id << "] " << info.file_name << " - "
+             << fixed << setprecision(1) << progress << "% (" << info.downloaded_chunks << "/" << info.total_chunks << ")" << endl;
     }
-    
-    std::cout << "--------------------------------------------------" << std::endl;
+
+    // Print completed entries with [C]
+    for (const auto& [id, info] : completed_downloads) {
+        cout << "[C] [" << info.group_id << "] " << info.file_name << " - Completed" << endl;
+    }
 }
 
 // Get file metadata
-const FileMetadata* FileShareManager::get_file_metadata(const std::string& file_name) const {
+const FileMetadata* FileShareManager::get_file_metadata(const string& file_name) const {
     auto it = file_metadata.find(file_name);
     if (it == file_metadata.end()) {
         return nullptr;
@@ -752,8 +818,8 @@ const FileMetadata* FileShareManager::get_file_metadata(const std::string& file_
 }
 
 // Check if a file is shared in a group
-bool FileShareManager::is_file_shared(const std::string& group_id, 
-                                    const std::string& file_name) const {
+bool FileShareManager::is_file_shared(const string& group_id, 
+                                    const string& file_name) const {
     auto group_it = shared_files.find(group_id);
     if (group_it == shared_files.end()) {
         return false;
@@ -763,13 +829,13 @@ bool FileShareManager::is_file_shared(const std::string& group_id,
 }
 
 // Stop sharing a file
-bool FileShareManager::stop_share(const std::string& group_id, 
-                                const std::string& file_name) {
+bool FileShareManager::stop_share(const string& group_id, 
+                                const string& file_name) {
     try {
         // Step 1: Verify the file is being shared by this client
         bool file_found = false;
         {
-            std::lock_guard<std::mutex> lock(shared_files_mutex);
+            lock_guard<mutex> lock(shared_files_mutex);
             auto group_it = shared_files.find(group_id);
             if (group_it != shared_files.end()) {
                 auto& files = group_it->second;
@@ -778,40 +844,40 @@ bool FileShareManager::stop_share(const std::string& group_id,
         }
         
         if (!file_found) {
-            std::cerr << "File not being shared by this client: " << file_name << std::endl;
+            cerr << "File not being shared by this client: " << file_name << endl;
             return false;
         }
         
         // Step 2: Notify the tracker
         int sock = connect_to_tracker();
         if (sock < 0) {
-            throw std::runtime_error("Failed to connect to tracker");
+            throw runtime_error("Failed to connect to tracker");
         }
         
-        std::string command = "stop_share " + group_id + " " + client_id + " " + file_name + "\n";
+        string command = "stop_share " + group_id + " " + client_id + " " + file_name + "\n";
         if (send(sock, command.c_str(), command.length(), MSG_NOSIGNAL) <= 0) {
             close(sock);
-            throw std::runtime_error("Failed to send stop_share command");
+            throw runtime_error("Failed to send stop_share command");
         }
 
         // Read one line of response
-        std::string response;
+        string response;
         char rbuf3[2048];
         ssize_t rn = recv(sock, rbuf3, sizeof(rbuf3), 0);
         if (rn > 0) {
             response.append(rbuf3, rn);
             size_t p = response.find('\n');
-            if (p != std::string::npos) response = response.substr(0, p);
+            if (p != string::npos) response = response.substr(0, p);
         }
         close(sock);
         
         if (response.find("SUCCESS") != 0) {
-            throw std::runtime_error("Failed to stop sharing: " + response);
+            throw runtime_error("Failed to stop sharing: " + response);
         }
         
         // Step 3: Update local state
         {
-            std::lock_guard<std::mutex> lock(shared_files_mutex);
+            lock_guard<mutex> lock(shared_files_mutex);
             
             // Remove from shared files
             auto group_it = shared_files.find(group_id);
@@ -825,11 +891,11 @@ bool FileShareManager::stop_share(const std::string& group_id,
             // Note: We don't remove file_metadata as it might be needed for active downloads
         }
         
-        std::cout << "Stopped sharing file: " << file_name << std::endl;
+        cout << "Stopped sharing file: " << file_name << endl;
         return true;
         
-    } catch (const std::exception& e) {
-        std::cerr << "Failed to stop sharing file: " << e.what() << std::endl;
+    } catch (const exception& e) {
+        cerr << "Failed to stop sharing file: " << e.what() << endl;
         return false;
     }
 }

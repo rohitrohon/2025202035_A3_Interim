@@ -1,2 +1,7 @@
 Setsockopt failed: Protocol not available
 Trying to connect to tracker 127.0.0.1:5000...
+Failed to connect to tracker 127.0.0.1:5000
+Trying to connect to tracker 127.0.0.1:6000...
+connect: Connection refused
+Failed to connect to tracker 127.0.0.1:6000
+Failed to connect to any tracker. Please check if any tracker is running.

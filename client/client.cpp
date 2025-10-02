@@ -31,8 +31,9 @@ using namespace std::filesystem;
 
 // Validate and sanitize file path to prevent directory traversal
 bool is_valid_path(const std::string& path) {
-    // Only allow files in the current directory or subdirectories
-    if (path.empty() || path[0] == '/' || path.find("../") != std::string::npos) {
+    // Disallow parent-directory traversal. Allow absolute and relative paths.
+    if (path.empty() || path.find("../") != std::string::npos) {
+        std::cerr << "DEBUG: is_valid_path rejected path: '" << path << "'" << std::endl;
         return false;
     }
     return true;
@@ -62,6 +63,13 @@ void handle_peer_connection(int peer_sock) {
     
     buffer[valread] = '\0';
     string request = string(buffer);
+    // Debug: log the raw peer request
+    std::cout << "DEBUG: Peer request received: '" << request << "' (len=" << valread << ")" << std::endl;
+    std::cout << "DEBUG: Peer request hex: ";
+    for (int i = 0; i < std::min((ssize_t)valread, (ssize_t)128); ++i) {
+        std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)buffer[i] << " ";
+    }
+    std::cout << std::dec << std::endl;
     
     // Parse request: format "filepath$chunkno$nchunks"
     size_t one = request.find('$');
@@ -99,8 +107,10 @@ void handle_peer_connection(int peer_sock) {
     }
     
     // Open file with error handling
+    std::cout << "DEBUG: Attempting to open file for peer request: '" << filepath << "'" << std::endl;
     int file = open(filepath.c_str(), O_RDONLY);
     if (file < 0) {
+        std::cerr << "DEBUG: open() failed for '" << filepath << "': " << strerror(errno) << std::endl;
         send_error_response(peer_sock, "File not found or permission denied");
         close(peer_sock);
         return;
@@ -219,12 +229,17 @@ void start_listening(int listen_port) {
         return;
     }
     
-    // Set socket options
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
-        cerr << "Setsockopt failed: " << strerror(errno) << endl;
-        close(server_fd);
-        return;
+    // Set socket options: set SO_REUSEADDR and (where available) SO_REUSEPORT separately
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        cerr << "Warning: setsockopt(SO_REUSEADDR) failed: " << strerror(errno) << endl;
+        // Not fatal, continue
     }
+#ifdef SO_REUSEPORT
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+        // Some platforms may not support SO_REUSEPORT; log but don't fatal
+        cerr << "Note: setsockopt(SO_REUSEPORT) failed or not supported: " << strerror(errno) << endl;
+    }
+#endif
     
     // Set non-blocking mode
     int flags = fcntl(server_fd, F_GETFL, 0);
@@ -389,7 +404,9 @@ int main(int argc, char *argv[]) {
         // Try to connect to this tracker
         // Send the client's listening port as part of the connection info
         // Format: "PORT <port>"
-        string client_info = "PORT " + to_string(listen_port);
+    // Send full listening address (ip:port) so tracker gets explicit peer address
+    string client_info = ip_address + ":" + to_string(listen_port);
+    client_info = "PORT " + client_info;
         sock = connect_to_tracker(track_ip, track_port, client_info);
         if (sock >= 0) {
             connected_tracker = track_ip + ":" + to_string(track_port);
@@ -487,6 +504,12 @@ int main(int argc, char *argv[]) {
             continue; // skip sending the command to the tracker
         }
 
+        // Local show_downloads command (also accept "show downloads")
+    if ( ( (!pre_toks.empty() && pre_toks[0] == "show_downloads") || (!pre_toks.empty() && pre_toks[0] == "show" && pre_toks.size() > 1 && pre_toks[1] == "downloads") ) && fsm) {
+            fsm->show_downloads();
+            continue;
+        }
+
         // Send the command with a newline terminator
         string command_to_send = command + "\n";
         
@@ -524,6 +547,18 @@ int main(int argc, char *argv[]) {
         string resp_str(response);
         cout << resp_str;
         if (!resp_str.empty() && resp_str.back() != '\n') cout << endl;
+
+        // If this was a login command and login succeeded, inform FileShareManager of our user id
+        if (!pre_toks.empty() && pre_toks[0] == "login" && fsm) {
+            if (resp_str.find("Login successful") == 0 || resp_str.find("Login successful") != string::npos) {
+                // pre_toks[1] is the user id
+                try {
+                    fsm->set_client_id(pre_toks[1]);
+                } catch (...) {
+                    // Ignore if fsm not set or method not available
+                }
+            }
+        }
 
         // If this was an upload_file command, remember the local path so we can process PROCESS_FILE
         // Parse the original command_to_send (without trailing newline)

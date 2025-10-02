@@ -31,12 +31,12 @@
 
 using namespace std;
 
-// Constants
-constexpr int SYNC_PORT = 8001;           // Default sync port for tracker 1
-constexpr int OTHER_SYNC_PORT = 8002;     // Default sync port for tracker 2
-constexpr int SYNC_INTERVAL_SEC = 5;      // How often to sync with other tracker
+// Constants (kept for reference; actual values come from sync_config)
+//constexpr int SYNC_PORT = 8001;           // Default sync port for tracker 1
+//constexpr int OTHER_SYNC_PORT = 8002;     // Default sync port for tracker 2
+//constexpr int SYNC_INTERVAL_SEC = 5;      // How often to sync with other tracker
 constexpr int SYNC_TIMEOUT_MS = 5000;     // 5 second timeout for sync operations
-constexpr int MAX_SYNC_RETRIES = 3;       // Number of times to retry failed syncs
+//constexpr int MAX_SYNC_RETRIES = 3;       // Number of times to retry failed syncs
 
 // Global variables
 namespace {
