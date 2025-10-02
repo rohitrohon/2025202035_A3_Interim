@@ -335,6 +335,56 @@ static string serialize_state() {
     ss << "}\n";
     pthread_mutex_unlock(&user_ip_port_mutex);
     
+    // Serialize file metadata
+    pthread_mutex_lock(&file_metadata_mutex);
+    ss << "FILE_METADATA:{";
+    for (const auto& [file_hash, file_info] : file_metadata) {
+        ss << file_hash << "|" 
+           << file_info.file_name << "|"
+           << file_info.file_path << "|"
+           << file_info.file_size << "|"
+           << file_info.owner_id << "|"
+           << file_info.total_chunks << "|";
+        
+        // Serialize chunk owners
+        for (const auto& [chunk_num, owners] : file_info.chunk_owners) {
+            ss << chunk_num << "[";
+            for (const auto& owner : owners) {
+                ss << owner << ",";
+            }
+            ss << "]";
+        }
+        ss << ";";
+    }
+    ss << "}\n";
+    pthread_mutex_unlock(&file_metadata_mutex);
+    
+    // Serialize group files mapping
+    pthread_mutex_lock(&group_files_mutex);
+    ss << "GROUP_FILES:{";
+    for (const auto& [group_id, files] : group_files) {
+        ss << group_id << "=";
+        for (const auto& file_hash : files) {
+            ss << file_hash << ",";
+        }
+        ss << ";";
+    }
+    ss << "}\n";
+    pthread_mutex_unlock(&group_files_mutex);
+    
+    // Serialize user files mapping
+    pthread_mutex_lock(&user_files_mutex);
+    ss << "USER_FILES:{";
+    for (const auto& [user_id, files] : user_files) {
+        ss << user_id << "=";
+        for (const auto& file_hash : files) {
+            ss << file_hash << ",";
+        }
+        ss << ";";
+    }
+    ss << "}\n";
+    pthread_mutex_unlock(&user_files_mutex);
+    
     return ss.str();
 }
 
@@ -509,20 +559,160 @@ static void apply_state(const string& state_str) {
                 requests_str.erase(0, pos + 1);
             }
             
-            // Merge pending requests
+            // Replace pending requests with the incoming state
+            // This ensures that if a request was removed on the other tracker, it's removed here too
             pthread_mutex_lock(&pending_requests_mutex);
-            for (const auto& [group, users] : new_requests) {
-                // If group doesn't exist in our requests, add it
-                if (pending_requests.find(group) == pending_requests.end()) {
-                    pending_requests[group] = users;
-                } else {
-                    // Otherwise merge the user sets
-                    pending_requests[group].insert(users.begin(), users.end());
-                }
-            }
+            pending_requests = new_requests;
             pthread_mutex_unlock(&pending_requests_mutex);
         }
-        // Handle other data types as needed...
+        else if (type == "FILE_METADATA") {
+            // Format: {file_hash1|name|path|size|owner|chunks|chunk_owners;file_hash2|...}
+            string files_str = content.substr(1, content.length() - 2);
+            unordered_map<string, FileInfo> new_metadata;
+            size_t pos = 0;
+            
+            while ((pos = files_str.find(';')) != string::npos) {
+                string entry = files_str.substr(0, pos);
+                if (!entry.empty()) {
+                    vector<string> parts;
+                    size_t part_start = 0;
+                    size_t part_end;
+                    
+                    // Split by | to get the main file info
+                    while ((part_end = entry.find('|', part_start)) != string::npos) {
+                        parts.push_back(entry.substr(part_start, part_end - part_start));
+                        part_start = part_end + 1;
+                    }
+                    // Add the last part (chunk owners)
+                    if (part_start < entry.length()) {
+                        parts.push_back(entry.substr(part_start));
+                    }
+                    
+                    if (parts.size() >= 6) {
+                        FileInfo info;
+                        string file_hash = parts[0];
+                        info.file_name = parts[1];
+                        info.file_path = parts[2];
+                        info.file_size = stoull(parts[3]);
+                        info.owner_id = parts[4];
+                        info.total_chunks = stoi(parts[5]);
+                        
+                        // Parse chunk owners if present
+                        if (parts.size() > 6) {
+                            string chunk_data = parts[6];
+                            size_t chunk_start = 0;
+                            
+                            while (chunk_start < chunk_data.length()) {
+                                size_t chunk_num_end = chunk_data.find('[', chunk_start);
+                                if (chunk_num_end == string::npos) break;
+                                
+                                int chunk_num = stoi(chunk_data.substr(chunk_start, chunk_num_end - chunk_start));
+                                size_t owners_start = chunk_num_end + 1;
+                                size_t owners_end = chunk_data.find(']', owners_start);
+                                
+                                if (owners_end == string::npos) break;
+                                
+                                string owners_str = chunk_data.substr(owners_start, owners_end - owners_start);
+                                stringstream owners_ss(owners_str);
+                                string owner;
+                                
+                                while (getline(owners_ss, owner, ',')) {
+                                    if (!owner.empty()) {
+                                        info.chunk_owners[chunk_num].insert(owner);
+                                    }
+                                }
+                                
+                                chunk_start = owners_end + 1;
+                            }
+                        }
+                        
+                        new_metadata[file_hash] = info;
+                    }
+                }
+                files_str.erase(0, pos + 1);
+            }
+            
+            // Update file metadata
+            pthread_mutex_lock(&file_metadata_mutex);
+            file_metadata = new_metadata; // Replace entire map to handle deletions
+            pthread_mutex_unlock(&file_metadata_mutex);
+        }
+        else if (type == "GROUP_FILES") {
+            // Format: {group1=file1,file2;group2=file3,file4;...}
+            string groups_str = content.substr(1, content.length() - 2);
+            unordered_map<string, set<string>> new_group_files;
+            size_t pos = 0;
+            
+            while ((pos = groups_str.find(';')) != string::npos) {
+                string entry = groups_str.substr(0, pos);
+                size_t eq_pos = entry.find('=');
+                if (eq_pos != string::npos) {
+                    string group = entry.substr(0, eq_pos);
+                    string files_str = entry.substr(eq_pos + 1);
+                    set<string> files;
+                    
+                    size_t comma_pos = 0;
+                    while ((comma_pos = files_str.find(',')) != string::npos) {
+                        string file = files_str.substr(0, comma_pos);
+                        if (!file.empty()) {
+                            files.insert(file);
+                        }
+                        files_str.erase(0, comma_pos + 1);
+                    }
+                    if (!files_str.empty()) {
+                        files.insert(files_str);
+                    }
+                    
+                    if (!group.empty() && !files.empty()) {
+                        new_group_files[group] = files;
+                    }
+                }
+                groups_str.erase(0, pos + 1);
+            }
+            
+            // Update group files
+            pthread_mutex_lock(&group_files_mutex);
+            group_files = new_group_files; // Replace entire map to handle deletions
+            pthread_mutex_unlock(&group_files_mutex);
+        }
+        else if (type == "USER_FILES") {
+            // Format: {user1=file1,file2;user2=file3,file4;...}
+            string users_str = content.substr(1, content.length() - 2);
+            unordered_map<string, set<string>> new_user_files;
+            size_t pos = 0;
+            
+            while ((pos = users_str.find(';')) != string::npos) {
+                string entry = users_str.substr(0, pos);
+                size_t eq_pos = entry.find('=');
+                if (eq_pos != string::npos) {
+                    string user = entry.substr(0, eq_pos);
+                    string files_str = entry.substr(eq_pos + 1);
+                    set<string> files;
+                    
+                    size_t comma_pos = 0;
+                    while ((comma_pos = files_str.find(',')) != string::npos) {
+                        string file = files_str.substr(0, comma_pos);
+                        if (!file.empty()) {
+                            files.insert(file);
+                        }
+                        files_str.erase(0, comma_pos + 1);
+                    }
+                    if (!files_str.empty()) {
+                        files.insert(files_str);
+                    }
+                    
+                    if (!user.empty() && !files.empty()) {
+                        new_user_files[user] = files;
+                    }
+                }
+                users_str.erase(0, pos + 1);
+            }
+            
+            // Update user files
+            pthread_mutex_lock(&user_files_mutex);
+            user_files = new_user_files; // Replace entire map to handle deletions
+            pthread_mutex_unlock(&user_files_mutex);
+        }
     }
 }
 

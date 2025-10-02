@@ -10,6 +10,18 @@
 #include <chrono>
 using namespace std;
 
+// Structure to store file information
+struct FileInfo {
+    string file_name;
+    string file_path;
+    uint64_t file_size;
+    string file_hash;
+    string owner_id;
+    int total_chunks;
+    map<int, set<string>> chunk_owners;  // chunk_num -> set of client_ids
+    std::vector<std::string> chunk_hashes; // per-chunk SHA1 hashes
+};
+
 // Data structures for tracker state
 extern unordered_map<string, string> user_data;
 extern unordered_map<string, bool> is_logged_in;
@@ -21,6 +33,11 @@ extern unordered_map<string, map<long long, string>> group_join_times;
 extern unordered_map<string, set<string>> pending_requests;
 extern unordered_map<string, pair<int, string>> user_ip_port;
 
+// File sharing data structures
+extern unordered_map<string, set<string>> group_files;  // group_id -> set of file_hashes
+extern unordered_map<string, FileInfo> file_metadata;  // file_hash -> FileInfo
+extern unordered_map<string, set<string>> user_files;  // user_id -> set of file_hashes
+
 // Mutexes for thread safety
 extern pthread_mutex_t user_data_mutex;
 extern pthread_mutex_t login_mutex;
@@ -30,6 +47,11 @@ extern pthread_mutex_t group_members_mutex;
 extern pthread_mutex_t group_join_times_mutex;
 extern pthread_mutex_t pending_requests_mutex;
 extern pthread_mutex_t user_ip_port_mutex;
+
+// File sharing mutexes
+extern pthread_mutex_t group_files_mutex;
+extern pthread_mutex_t file_metadata_mutex;
+extern pthread_mutex_t user_files_mutex;
 
 // Initialize all mutexes
 void initialize_mutexes();

@@ -2,23 +2,22 @@
 #define FILE_OPERATIONS_H
 
 #include <string>
+#include <cstdint>  // for uint64_t
 #include <vector>
-#include <fstream>
-#include <sstream>
-#include <iomanip>
 #include <openssl/sha.h>
-#include <filesystem>
 
-namespace fs = std::filesystem;
+using namespace std;
 
-// Structure to hold file chunk information
+// --------------------------------------------
+// Structures for metadata
+// --------------------------------------------
 struct FileChunk {
     int chunk_number;
     std::string hash;
     bool is_available;
+    bool is_verified;   // NEW: track per-chunk verification
 };
 
-// Structure to hold file metadata
 struct FileMetadata {
     std::string file_name;
     std::string file_path;
@@ -28,25 +27,30 @@ struct FileMetadata {
     std::vector<FileChunk> chunks;
 };
 
-// Function to calculate SHA1 hash of a file
+// --------------------------------------------
+// Function declarations
+// --------------------------------------------
+
+// Hash utilities
+std::string calculate_sha1(const std::string& data);
 std::string calculate_file_hash(const std::string& file_path);
+bool verify_chunk(const std::string& chunk_path, const std::string& expected_hash);
 
-// Function to split a file into chunks and calculate their hashes
-FileMetadata split_file_into_chunks(const std::string& file_path, size_t chunk_size = 512 * 1024);
-
-// Function to combine chunks back into a file
+// File splitting and combining
+FileMetadata split_file_into_chunks(const std::string& file_path);  // fixed 512KB chunk size
 bool combine_chunks(const std::string& output_path, const std::string& temp_dir, int total_chunks);
 
-// Function to verify the integrity of a downloaded file
+// File integrity
 bool verify_file_integrity(const std::string& file_path, const std::string& expected_hash);
 
-// Function to save file metadata to disk
+// Metadata operations
 bool save_metadata(const FileMetadata& metadata, const std::string& output_path);
-
-// Function to load file metadata from disk
 FileMetadata load_metadata(const std::string& metadata_path);
 
-// Function to get the chunk file path
+// Chunk path generator
 std::string get_chunk_path(const std::string& base_dir, const std::string& file_name, int chunk_number);
+
+// File path utilities
+std::string get_file_name_from_path(const std::string& file_path);
 
 #endif // FILE_OPERATIONS_H

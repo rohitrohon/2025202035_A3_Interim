@@ -5,14 +5,18 @@ LDFLAGS = -pthread -L/opt/homebrew/opt/openssl@3/lib -lssl -lcrypto
 
 # Source files for client
 CLIENT_SRCS = client.cpp \
-             file_operations.cpp \
-             network_utils.cpp
+             file_share_manager.cpp \
+             network_utils.cpp \
+             file_operations.cpp
 
 # Object files
 CLIENT_OBJS = $(CLIENT_SRCS:.cpp=.o)
 
 # Header files
-DEPS = $(wildcard *.h)
+DEPS = client.h \
+       file_share_manager.h \
+       network_utils.h \
+       file_operations.h
 
 # Output binary
 TARGET = client

@@ -1,6 +1,7 @@
 #include "client.h"
 #include "network_utils.h"
-#include "file_utils.h"
+#include "file_operations.h"
+#include "file_share_manager.h"
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -312,14 +313,7 @@ void start_listening(int listen_port) {
     close(server_fd);
 }
 
-// Helper function to extract filename from path
-std::string get_file_name_from_path(const std::string& path) {
-    size_t last_slash = path.find_last_of("/\\");
-    if (last_slash != std::string::npos) {
-        return path.substr(last_slash + 1);
-    }
-    return path;
-}
+// get_file_name_from_path is defined in file_operations.cpp
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
@@ -366,6 +360,8 @@ int main(int argc, char *argv[]) {
     string line;
     int sock = -1;
     string connected_tracker;
+    // FileShareManager will be created once we connect to a tracker
+    std::unique_ptr<FileShareManager> fsm;
     
     // Try each tracker in sequence until one connects successfully
     while (getline(ss, line)) {
@@ -398,6 +394,10 @@ int main(int argc, char *argv[]) {
         if (sock >= 0) {
             connected_tracker = track_ip + ":" + to_string(track_port);
             cout << "Connected to tracker " << connected_tracker << " (listening on port " << listen_port << ")" << endl;
+            // Instantiate FileShareManager tied to this tracker
+            fsm.reset(new FileShareManager("", track_ip, track_port));
+            // Provide the control socket to the FileShareManager so it can reuse it
+            fsm->set_control_socket(sock);
             // Send a newline to ensure the message is flushed
             send(sock, "\n", 1, 0);
             break;
@@ -440,6 +440,9 @@ int main(int argc, char *argv[]) {
         recv(sock, initial_buffer, sizeof(initial_buffer) - 1, 0);
     }
     
+    // Track last upload path (used when tracker asks PROCESS_FILE)
+    string last_upload_path;
+
     // Main command loop
     while (true) {
         string command;
@@ -464,6 +467,26 @@ int main(int argc, char *argv[]) {
             break;
         }
         
+        // Tokenize command to special-case certain commands locally
+        istringstream pre_ss(command);
+        vector<string> pre_toks; string pre_tk;
+        while (pre_ss >> pre_tk) pre_toks.push_back(pre_tk);
+
+        // If this is a download_file command, run it locally using FileShareManager
+        if (!pre_toks.empty() && pre_toks[0] == "download_file" && fsm) {
+            if (pre_toks.size() < 4) {
+                cout << "Usage: download_file <group_id> <file_name> <dest_path>" << endl;
+            } else {
+                string group_id = pre_toks[1];
+                string file_name = pre_toks[2];
+                string dest_path = pre_toks[3];
+                cout << "DEBUG: Running local download_file via FileShareManager" << endl;
+                bool ok = fsm->download_file(group_id, file_name, dest_path);
+                if (!ok) cout << "Download failed." << endl;
+            }
+            continue; // skip sending the command to the tracker
+        }
+
         // Send the command with a newline terminator
         string command_to_send = command + "\n";
         
@@ -493,15 +516,80 @@ int main(int argc, char *argv[]) {
         char response[1024] = {0};
         ssize_t valread = recv(sock, response, sizeof(response) - 1, 0);
         
-        if (valread > 0) {
-            cout << response;
-            // Ensure the response ends with a newline
-            if (response[strlen(response) - 1] != '\n') {
-                cout << endl;
-            }
-        } else {
+        if (valread <= 0) {
             cout << "Tracker disconnected!" << endl;
             break;
+        }
+
+        string resp_str(response);
+        cout << resp_str;
+        if (!resp_str.empty() && resp_str.back() != '\n') cout << endl;
+
+        // If this was an upload_file command, remember the local path so we can process PROCESS_FILE
+        // Parse the original command_to_send (without trailing newline)
+        {
+            string cmd_copy = command; // original user command (trimmed)
+            // Simple tokenization
+            istringstream css(cmd_copy);
+            vector<string> toks;
+            string tk;
+            while (css >> tk) toks.push_back(tk);
+            if (!toks.empty() && toks[0] == "upload_file" && toks.size() >= 3) {
+                // last token is the file path argument (may contain no spaces in this simple parser)
+                last_upload_path = toks.back();
+            }
+        }
+
+        // Handle special tracker responses
+        // Detect PROCESS_FILE <temp_file_id> <file_name> <file_size>
+        {
+            istringstream riss(resp_str);
+            vector<string> rtoks; string rtk;
+            while (riss >> rtk) rtoks.push_back(rtk);
+            if (!rtoks.empty() && rtoks[0] == "PROCESS_FILE") {
+                if (rtoks.size() >= 4) {
+                    string temp_file_id = rtoks[1];
+                    // string file_name = rtoks[2];
+                    // string file_size_str = rtoks[3];
+
+                    if (last_upload_path.empty()) {
+                        cout << "No local path recorded for upload; cannot process file metadata" << endl;
+                    } else {
+                        try {
+                            // Compute metadata locally
+                            FileMetadata meta = split_file_into_chunks(last_upload_path);
+                            meta.file_hash = calculate_file_hash(last_upload_path);
+
+                            // Build update command including per-chunk hashes
+                            string update_cmd = "update_file_metadata " + temp_file_id + " " +
+                                meta.file_hash + " " + to_string(meta.file_size) + " " + to_string(meta.total_chunks);
+                            for (const auto &c : meta.chunks) {
+                                update_cmd += " " + c.hash;
+                            }
+                            update_cmd += "\n";
+
+                            // Send update command on same socket
+                            ssize_t sent = send(sock, update_cmd.c_str(), update_cmd.length(), 0);
+                            if (sent <= 0) {
+                                cout << "Failed to send update_file_metadata to tracker" << endl;
+                            } else {
+                                // Wait for tracker's response
+                                char upd_resp[2048] = {0};
+                                ssize_t rn = recv(sock, upd_resp, sizeof(upd_resp)-1, 0);
+                                if (rn > 0) {
+                                    cout << string(upd_resp, rn);
+                                }
+                            }
+                        } catch (const std::exception& e) {
+                            cout << "Error processing file: " << e.what() << endl;
+                        }
+                        // Clear last_upload_path after processing
+                        last_upload_path.clear();
+                    }
+                } else {
+                    cout << "Malformed PROCESS_FILE response from tracker" << endl;
+                }
+            }
         }
     }
     

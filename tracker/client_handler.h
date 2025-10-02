@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <cstdint>
 
 using namespace std;
 
@@ -36,5 +37,17 @@ void join_group(const vector<string>& tokens, int client_sock, const string& cli
 void list_requests(const vector<string>& tokens, int client_sock, const string& client_user_id);
 void accept_request(const vector<string>& tokens, int client_sock, const string& client_user_id);
 void leave_group(const vector<string>& tokens, int client_sock, const string& client_user_id);
+
+// File sharing commands
+void upload_file(const vector<string>& tokens, int client_sock, const string& client_user_id);
+void download_file(const vector<string>& tokens, int client_sock, const string& client_user_id);
+void list_files(const vector<string>& tokens, int client_sock, const string& client_user_id);
+void stop_share(const vector<string>& tokens, int client_sock, const string& client_user_id);
+void get_peers(const vector<string>& tokens, int client_sock, const string& client_user_id);
+void update_file_metadata(const vector<string>& tokens, int client_sock, const string& client_user_id);
+
+// Helper functions
+string get_client_address(const string& client_id);
+void send_response(int sock, const string& response);
 
 #endif

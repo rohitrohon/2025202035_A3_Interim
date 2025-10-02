@@ -4,21 +4,27 @@
 #include <sstream>
 #include <iomanip>
 #include <openssl/sha.h>
-#include <filesystem>
 #include <vector>
 #include <cstring>
+#include <sys/stat.h>   // mkdir
+#include <sys/types.h>
+#include <unistd.h>
 
-namespace fs = std::filesystem;
+const size_t CHUNK_SIZE = 512 * 1024; // 512 KB fixed chunk size
 
+// --------------------------------------------
+// SHA1 calculation helpers
+// --------------------------------------------
 std::string calculate_sha1(const std::string& data) {
     unsigned char hash[SHA_DIGEST_LENGTH];
     SHA1(reinterpret_cast<const unsigned char*>(data.c_str()), data.size(), hash);
-    
+
     std::stringstream ss;
     for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
-        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
+        ss << std::hex << std::setw(2) << std::setfill('0') 
+           << static_cast<int>(hash[i]);
     }
-    
+
     return ss.str();
 }
 
@@ -27,117 +33,145 @@ std::string calculate_file_hash(const std::string& file_path) {
     if (!file) {
         throw std::runtime_error("Could not open file: " + file_path);
     }
-    
+
     const size_t buffer_size = 8192;
     char buffer[buffer_size];
     unsigned char hash[SHA_DIGEST_LENGTH] = {0};
     SHA_CTX sha1_context;
-    
+
     SHA1_Init(&sha1_context);
-    
+
     while (file.good()) {
         file.read(buffer, buffer_size);
         SHA1_Update(&sha1_context, buffer, file.gcount());
     }
-    
+
     SHA1_Final(hash, &sha1_context);
-    
+
     std::stringstream ss;
     for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
-        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
+        ss << std::hex << std::setw(2) << std::setfill('0') 
+           << static_cast<int>(hash[i]);
     }
-    
+
     return ss.str();
 }
 
-FileMetadata split_file_into_chunks(const std::string& file_path, size_t chunk_size) {
+// --------------------------------------------
+// Verify a chunk hash immediately after writing
+// --------------------------------------------
+bool verify_chunk(const std::string& chunk_path, const std::string& expected_hash) {
+    std::ifstream file(chunk_path, std::ios::binary);
+    if (!file) return false;
+
+    std::ostringstream ss;
+    ss << file.rdbuf();
+    std::string actual_hash = calculate_sha1(ss.str());
+    return (actual_hash == expected_hash);
+}
+
+// --------------------------------------------
+// Split file into fixed 512KB chunks
+// --------------------------------------------
+FileMetadata split_file_into_chunks(const std::string& file_path) {
     FileMetadata metadata;
     metadata.file_path = file_path;
-    metadata.file_name = fs::path(file_path).filename().string();
-    
+    metadata.file_name = file_path.substr(file_path.find_last_of("/\\") + 1);
+
     // Open the input file
     std::ifstream input_file(file_path, std::ios::binary | std::ios::ate);
     if (!input_file) {
         throw std::runtime_error("Could not open file: " + file_path);
     }
-    
+
     // Get file size
     metadata.file_size = input_file.tellg();
     input_file.seekg(0, std::ios::beg);
-    
+
     // Calculate number of chunks
-    metadata.total_chunks = (metadata.file_size + chunk_size - 1) / chunk_size;
-    
+    metadata.total_chunks = (metadata.file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
     // Create a temporary directory for chunks
     std::string temp_dir = "./chunks/" + metadata.file_name + "_chunks";
-    fs::create_directories(temp_dir);
-    
+    mkdir("./chunks", 0777);   // ensure parent dir exists
+    mkdir(temp_dir.c_str(), 0777);
+
     // Buffer for reading
-    std::vector<char> buffer(chunk_size);
+    std::vector<char> buffer(CHUNK_SIZE);
     int chunk_number = 0;
-    
+
     // Read and split the file
     while (input_file) {
-        input_file.read(buffer.data(), chunk_size);
+        input_file.read(buffer.data(), CHUNK_SIZE);
         std::streamsize bytes_read = input_file.gcount();
-        
+
         if (bytes_read > 0) {
             std::string chunk_filename = get_chunk_path(temp_dir, metadata.file_name, chunk_number);
-            
+
             // Write the chunk to disk
             std::ofstream chunk_file(chunk_filename, std::ios::binary);
             if (!chunk_file) {
                 throw std::runtime_error("Could not create chunk file: " + chunk_filename);
             }
-            
+
             chunk_file.write(buffer.data(), bytes_read);
             chunk_file.close();
-            
+
             // Calculate chunk hash
             std::string chunk_hash = calculate_sha1(std::string(buffer.data(), bytes_read));
-            
+
+            // Verify chunk immediately
+            bool verified = verify_chunk(chunk_filename, chunk_hash);
+
             // Store chunk metadata
             FileChunk chunk_info;
             chunk_info.chunk_number = chunk_number;
             chunk_info.hash = chunk_hash;
             chunk_info.is_available = true;
+            chunk_info.is_verified = verified;
             metadata.chunks.push_back(chunk_info);
-            
+
             chunk_number++;
         }
     }
-    
+
     // Calculate the overall file hash
     metadata.file_hash = calculate_file_hash(file_path);
-    
+
     return metadata;
 }
 
+// --------------------------------------------
+// Combine chunks back into a single file
+// --------------------------------------------
 bool combine_chunks(const std::string& output_path, const std::string& temp_dir, int total_chunks) {
     std::ofstream output_file(output_path, std::ios::binary);
     if (!output_file) {
         std::cerr << "Could not create output file: " << output_path << std::endl;
         return false;
     }
-    
+
     for (int i = 0; i < total_chunks; i++) {
         std::string chunk_path = temp_dir + "/chunk_" + std::to_string(i);
         std::ifstream chunk_file(chunk_path, std::ios::binary);
-        
+
         if (!chunk_file) {
             std::cerr << "Could not open chunk file: " << chunk_path << std::endl;
             return false;
         }
-        
+
         // Read and write the chunk
         output_file << chunk_file.rdbuf();
         chunk_file.close();
     }
-    
+
     output_file.close();
     return true;
 }
 
+// --------------------------------------------
+// Verify full file integrity
+// --------------------------------------------
 bool verify_file_integrity(const std::string& file_path, const std::string& expected_hash) {
     try {
         std::string actual_hash = calculate_file_hash(file_path);
@@ -148,48 +182,59 @@ bool verify_file_integrity(const std::string& file_path, const std::string& expe
     }
 }
 
+// --------------------------------------------
+// Save metadata to file
+// --------------------------------------------
 bool save_metadata(const FileMetadata& metadata, const std::string& output_path) {
     std::ofstream out_file(output_path);
     if (!out_file) {
         return false;
     }
-    
+
     out_file << "file_name:" << metadata.file_name << "\n";
     out_file << "file_path:" << metadata.file_path << "\n";
     out_file << "file_size:" << metadata.file_size << "\n";
     out_file << "file_hash:" << metadata.file_hash << "\n";
     out_file << "total_chunks:" << metadata.total_chunks << "\n";
-    
+
     out_file << "chunks:\n";
     for (const auto& chunk : metadata.chunks) {
-        out_file << chunk.chunk_number << "," << chunk.hash << "," << chunk.is_available << "\n";
+        out_file << chunk.chunk_number << ","
+                 << chunk.hash << ","
+                 << chunk.is_available << ","
+                 << chunk.is_verified << "\n";
     }
-    
+
     out_file.close();
     return true;
 }
 
+// --------------------------------------------
+// Load metadata back
+// --------------------------------------------
 FileMetadata load_metadata(const std::string& metadata_path) {
     FileMetadata metadata;
     std::ifstream in_file(metadata_path);
-    
+
     if (!in_file) {
         throw std::runtime_error("Could not open metadata file: " + metadata_path);
     }
-    
+
     std::string line;
     while (std::getline(in_file, line)) {
         if (line == "chunks:") {
             // Start reading chunks
             while (std::getline(in_file, line)) {
-                size_t comma1 = line.find(',');
-                size_t comma2 = line.find(',', comma1 + 1);
-                
-                if (comma1 != std::string::npos && comma2 != std::string::npos) {
+                size_t c1 = line.find(',');
+                size_t c2 = line.find(',', c1 + 1);
+                size_t c3 = line.find(',', c2 + 1);
+
+                if (c1 != std::string::npos && c2 != std::string::npos && c3 != std::string::npos) {
                     FileChunk chunk;
-                    chunk.chunk_number = std::stoi(line.substr(0, comma1));
-                    chunk.hash = line.substr(comma1 + 1, comma2 - comma1 - 1);
-                    chunk.is_available = (line.substr(comma2 + 1) == "1");
+                    chunk.chunk_number = std::stoi(line.substr(0, c1));
+                    chunk.hash = line.substr(c1 + 1, c2 - c1 - 1);
+                    chunk.is_available = (line.substr(c2 + 1, c3 - c2 - 1) == "1");
+                    chunk.is_verified = (line.substr(c3 + 1) == "1");
                     metadata.chunks.push_back(chunk);
                 }
             }
@@ -198,7 +243,7 @@ FileMetadata load_metadata(const std::string& metadata_path) {
             if (colon != std::string::npos) {
                 std::string key = line.substr(0, colon);
                 std::string value = line.substr(colon + 1);
-                
+
                 if (key == "file_name") metadata.file_name = value;
                 else if (key == "file_path") metadata.file_path = value;
                 else if (key == "file_size") metadata.file_size = std::stoull(value);
@@ -207,10 +252,30 @@ FileMetadata load_metadata(const std::string& metadata_path) {
             }
         }
     }
-    
+
     return metadata;
 }
 
+// --------------------------------------------
+// Chunk path generator
+// --------------------------------------------
 std::string get_chunk_path(const std::string& base_dir, const std::string& file_name, int chunk_number) {
     return base_dir + "/chunk_" + std::to_string(chunk_number);
 }
+
+// --------------------------------------------
+// File path utilities
+// --------------------------------------------
+std::string get_file_name_from_path(const std::string& file_path) {
+    size_t pos = file_path.find_last_of("/");
+    if (pos != std::string::npos) {
+        return file_path.substr(pos + 1);
+    }
+    return file_path;
+}
+
+// --------------------------------------------
+// Networking placeholders (to be integrated)
+// --------------------------------------------
+// send_chunk(socket_fd, chunk_path)
+// recv_chunk(socket_fd, expected_hash, save_path)
